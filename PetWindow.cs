@@ -151,6 +151,9 @@ internal sealed class PetWindow : Window
     /// <summary>Test seam: visible and NOT on an auto-hide timer (approval mode).</summary>
     internal bool BubbleSticky { get { return BubbleVisible && !_bubbleTimer.IsEnabled; } }
 
+    /// <summary>Test seam: the text currently in the bubble.</summary>
+    internal string BubbleText { get { return _bubbleText.Text; } }
+
     // ---- position ----------------------------------------------------------
     private static string PosFile
     {

@@ -42,6 +42,52 @@ internal sealed class ApprovalItem
     public DateTime SeenAt = DateTime.Now;
 }
 
+/// <summary>
+/// One "the model is asking you to choose" request. Frames come from the same
+/// downlink as approvals and are equally authoritative:
+///   question/requested { sessionId, questions:[ { id, question, detail?,
+///                        header?, options?:[{label,description?}],
+///                        multiSelect?, intent?:{kind,approve} } ] }
+///   question/resolved  { sessionId, questionRpcId, outcome: answered|cancelled }
+/// The envelope rpcId IS the questionRpcId. Unlike an approval, a question is
+/// never auto-answered - it waits for a human (in the web UI or in the shell),
+/// which is exactly why it deserves a reminder.
+/// </summary>
+internal sealed class QuestionItem
+{
+    public string RpcId = "";
+    public string SessionId = "";
+    public string Header = "";        // short label, when the asker supplied one
+    public string Text = "";          // the question itself
+    public string Detail = "";        // helper text / the plan being reviewed
+    public int OptionCount;
+    public bool MultiSelect;
+    public bool PlanReview;           // intent.kind == "plan-review"
+    public DateTime SeenAt = DateTime.Now;
+
+    /// <summary>Short label for the bubble / notification title.</summary>
+    public string Label
+    {
+        get
+        {
+            if (PlanReview) return "计划待审";
+            if (Header.Length > 0) return Header;
+            return "模型在等你选";
+        }
+    }
+
+    /// <summary>One-line gist: the question, or the plan-review hint.</summary>
+    public string Gist
+    {
+        get
+        {
+            string s = Text.Length > 0 ? Text : (Detail.Length > 0 ? Detail : Header);
+            if (OptionCount > 0) s += "（" + OptionCount + (MultiSelect ? " 个选项，可多选）" : " 选 1）");
+            return s;
+        }
+    }
+}
+
 /// <summary>One turn boundary, or the user speaking in a session.</summary>
 internal sealed class TurnEvent
 {
@@ -59,6 +105,10 @@ internal static class Mux
     internal static event Action<ApprovalItem> Requested;
     /// <summary>Raised (background thread) with the approvalId when one is settled.</summary>
     internal static event Action<string> Resolved;
+    /// <summary>Raised (background thread) when the model asks the user to choose.</summary>
+    internal static event Action<QuestionItem> QuestionRequested;
+    /// <summary>Raised (background thread) with the questionRpcId once it is settled.</summary>
+    internal static event Action<string> QuestionResolved;
     /// <summary>Raised (background thread) on every turn/start and turn/end.</summary>
     internal static event Action<TurnEvent> TurnChanged;
     /// <summary>Raised (background thread) when the mux connection state changes.</summary>
@@ -155,12 +205,93 @@ internal static class Mux
             }
             return;
         }
+        QuestionItem q;
+        if (ParseQuestionFrame(json, out q, out method))
+        {
+            if (method == "question/requested")
+            {
+                Action<QuestionItem> h = QuestionRequested;
+                if (h != null) h(q);
+            }
+            else if (method == "question/resolved")
+            {
+                Action<string> h = QuestionResolved;
+                if (h != null) h(q.RpcId);
+            }
+            return;
+        }
         TurnEvent te;
         if (ParseTurnFrame(json, out te))
         {
             Action<TurnEvent> h = TurnChanged;
             if (h != null) h(te);
         }
+    }
+
+    /// <summary>
+    /// Parses a question frame. Returns true for "question/requested" (with the
+    /// first question's text/options filled in) and "question/resolved" (with
+    /// <see cref="QuestionItem.RpcId"/> = the settled questionRpcId). Pure.
+    /// </summary>
+    internal static bool ParseQuestionFrame(string json, out QuestionItem item, out string method)
+    {
+        item = null;
+        method = "";
+        try
+        {
+            var d = new JavaScriptSerializer().DeserializeObject(json) as Dictionary<string, object>;
+            if (d == null) return false;
+            if (!"server-request".Equals(Str(d, "type"), StringComparison.Ordinal)) return false;
+            method = Str(d, "method");
+            if (method != "question/requested" && method != "question/resolved") return false;
+            var p = Get(d, "payload");
+            if (p == null) return false;
+
+            var it = new QuestionItem();
+            it.SessionId = Str(p, "sessionId");
+            if (method == "question/resolved")
+            {
+                it.RpcId = Str(p, "questionRpcId");
+                if (it.RpcId.Length == 0) it.RpcId = Str(d, "rpcId");
+                if (it.RpcId.Length == 0) return false;
+                item = it;
+                return true;
+            }
+
+            it.RpcId = Str(d, "rpcId");
+            if (it.RpcId.Length == 0) return false;
+            object raw;
+            if (!p.TryGetValue("questions", out raw)) return false;
+            var arr = raw as object[];
+            if (arr == null || arr.Length == 0) return false;
+            var q0 = arr[0] as Dictionary<string, object>;
+            if (q0 == null) return false;
+            it.Text = Str(q0, "question");
+            it.Detail = Str(q0, "detail");
+            it.Header = Str(q0, "header");
+            if (it.Text.Length == 0 && it.Header.Length == 0 && it.Detail.Length == 0) return false;
+            object mv;
+            if (q0.TryGetValue("multiSelect", out mv) && mv != null)
+            {
+                try { it.MultiSelect = Convert.ToBoolean(mv); } catch { }
+            }
+            object opts;
+            if (q0.TryGetValue("options", out opts))
+            {
+                var oa = opts as object[];
+                if (oa != null) it.OptionCount = oa.Length;
+            }
+            object intent;
+            if (q0.TryGetValue("intent", out intent))
+            {
+                var idict = intent as Dictionary<string, object>;
+                if (idict != null && Str(idict, "kind") == "plan-review") it.PlanReview = true;
+            }
+            item = it;
+            return true;
+        }
+        catch { }
+        return false;
     }
 
     /// <summary>

@@ -2419,6 +2419,12 @@ internal class DshWindow : Window
     private ApprovalsView _approvalsView;
     private readonly Dictionary<string, DispatcherTimer> _approvalGrace = new Dictionary<string, DispatcherTimer>();
     private readonly HashSet<string> _notified = new HashSet<string>();
+    /// <summary>questionRpcId -> the question, while the model still waits for an answer.</summary>
+    private readonly Dictionary<string, QuestionItem> _pendingQuestions = new Dictionary<string, QuestionItem>();
+    /// <summary>questionRpcId -> grace timer (see QuestionGraceSeconds).</summary>
+    private readonly Dictionary<string, DispatcherTimer> _questionGrace = new Dictionary<string, DispatcherTimer>();
+    /// <summary>questionRpcIds we already alerted about (so the bubble can be re-shown).</summary>
+    private readonly HashSet<string> _questionNotified = new HashSet<string>();
     private double _budgetDay, _budgetMonth, _budgetWarn = 80;
     private string _budgetWarnedKey = "";
 
@@ -2632,11 +2638,7 @@ internal class DshWindow : Window
                 _pet.Scene.Rate = _petRate;
                 _pet.SetTarget(_petBusy);
                 // a re-created pet must not lose a reminder that really waits
-                foreach (string id in _notified)
-                {
-                    ApprovalItem waiting = _approvalsView == null ? null : _approvalsView.Get(id);
-                    if (waiting != null) { ShowApprovalBubble(waiting); break; }
-                }
+                RefreshReminderBubble();
             }
             else if (_pet != null)
             {
@@ -2747,23 +2749,127 @@ internal class DshWindow : Window
         // notification - that is what makes the tray red dot disappear without
         // wiping unrelated unread alerts.
         if (Notifications.MarkReadByRef(approvalId) > 0) LoadNotifications();
+        RefreshReminderBubble();
+    }
 
-        ApprovalItem next = null;
+    // ---- the model asks the user to choose (question/*) ---------------------
+    // Same reminder contract as an approval - pet holds at 80% with a sticky
+    // bubble, a notification lands with the questionRpcId as its ref, and the
+    // tray dot follows - because a question ALSO stops the agent until a human
+    // answers it. The grace period is shorter: nothing else answers a question
+    // for you, so a few seconds only covers "the user was already in the web UI".
+    private const double QuestionGraceSeconds = 4;
+
+    private void OnQuestionRequested(QuestionItem q)
+    {
+        _pendingQuestions[q.RpcId] = q;
+        DispatcherTimer timer = new DispatcherTimer { Interval = TimeSpan.FromSeconds(QuestionGraceSeconds) };
+        timer.Tick += delegate
+        {
+            timer.Stop();
+            _questionGrace.Remove(q.RpcId);
+            if (!_pendingQuestions.ContainsKey(q.RpcId)) return;      // already answered
+            NotifyQuestion(q);
+        };
+        _questionGrace[q.RpcId] = timer;
+        timer.Start();
+    }
+
+    /// <summary>Shows the sticky bubble / notification for a question that really waits.</summary>
+    private void NotifyQuestion(QuestionItem q)
+    {
+        string title = q.PlanReview ? "计划待审" : "等待你的选择";
+        string sub = Short(q.Gist, 90);
+        PushEvent(title, sub, WpfTheme.Warning);
+        Notifications.Add(title, sub, "warn", q.RpcId, q.SessionId);
+        _questionNotified.Add(q.RpcId);
+        LoadNotifications();
+        RefreshReminderBubble();
+    }
+
+    private void OnQuestionResolved(string rpcId)
+    {
+        DispatcherTimer timer;
+        if (_questionGrace.TryGetValue(rpcId, out timer))
+        {
+            timer.Stop();
+            _questionGrace.Remove(rpcId);
+        }
+        _pendingQuestions.Remove(rpcId);
+        _questionNotified.Remove(rpcId);
+        if (Notifications.MarkReadByRef(rpcId) > 0) LoadNotifications();
+        RefreshReminderBubble();
+    }
+
+    /// <summary>Drops every pending question of one session (turn ended / session gone).</summary>
+    private void ClearQuestionsOf(string sessionId)
+    {
+        if (_pendingQuestions.Count == 0) return;
+        var stale = new List<string>();
+        foreach (KeyValuePair<string, QuestionItem> kv in _pendingQuestions)
+            if (kv.Value.SessionId == sessionId) stale.Add(kv.Key);
+        for (int i = 0; i < stale.Count; i++) OnQuestionResolved(stale[i]);
+    }
+
+    /// <summary>Test seam: questionRpcIds the shell currently treats as waiting.</summary>
+    internal int PendingQuestionCount { get { return _pendingQuestions.Count; } }
+
+    /// <summary>Test seam: drive the mux question handlers without a live backend.</summary>
+    internal void PreviewQuestionRequested(QuestionItem q) { OnQuestionRequested(q); }
+    internal void PreviewQuestionResolved(string rpcId) { OnQuestionResolved(rpcId); }
+
+    /// <summary>
+    /// Test seam: what the grace timer does when it fires - alert only while the
+    /// question is still waiting.
+    /// </summary>
+    internal void PreviewQuestionGraceElapsed(string rpcId)
+    {
+        QuestionItem q;
+        if (!_pendingQuestions.TryGetValue(rpcId, out q)) return;
+        NotifyQuestion(q);
+    }
+
+    /// <summary>Test seam: the shell's own pet window (null when the pet is off).</summary>
+    internal PetWindow PreviewPet { get { return _pet; } }
+
+    /// <summary>
+    /// Keeps the pet's sticky reminder in sync with reality: a notified approval
+    /// or question that is STILL waiting owns the bubble; when none is left, the
+    /// bubble and the 80% hold are released. Approvals and questions share one
+    /// bubble, so this is the single place that decides who gets it.
+    /// </summary>
+    private void RefreshReminderBubble()
+    {
+        ApprovalItem ap = null;
         foreach (string id in _notified)
         {
-            next = _approvalsView.Get(id);
-            if (next != null) break;
+            ap = _approvalsView.Get(id);
+            if (ap != null) break;
         }
-        if (next != null)
+        if (ap != null) { ShowApprovalBubble(ap); return; }
+
+        QuestionItem q = null;
+        foreach (string id in _questionNotified)
         {
-            ShowApprovalBubble(next);          // another notified one is still waiting
-            return;
+            QuestionItem cand;
+            if (_pendingQuestions.TryGetValue(id, out cand)) { q = cand; break; }
         }
+        if (q != null) { ShowQuestionBubble(q); return; }
+
         if (_pet != null)
         {
             _pet.HideBubble();
             _pet.ReleaseHold();
         }
+    }
+
+    private void ShowQuestionBubble(QuestionItem q)
+    {
+        if (_pet == null || q == null) return;
+        _pet.Hold(PetScene.BurstAmount);
+        string head = q.PlanReview ? "计划待审（等着你确认）"
+            : (q.Header.Length > 0 ? q.Header : "模型在等你选");
+        _pet.ShowBubble(head + "\n" + Short(q.Gist, 110), 0);
     }
 
     private void ShowApprovalBubble(ApprovalItem it)
@@ -2828,6 +2934,19 @@ internal class DshWindow : Window
     public void PreviewRefreshUsage()
     {
         try { RefreshUsageCost(); } catch { }
+        // The service card is normally filled by the 1s tick, which the probe never
+        // reaches - fill it here so a screenshot shows the real state instead of
+        // three dashes.
+        try
+        {
+            bool running = Program.ServerRunning();
+            if (running)
+                UpdateServiceInfo(_alreadyRunning ? "外部实例" : _host.Pid.ToString(), Program.BuildId,
+                    _alreadyRunning ? "由其他实例运行" : (_host.StartedAt ?? DateTime.Now).ToString("yyyy-MM-dd HH:mm:ss"));
+            else
+                UpdateServiceInfo("-", Program.BuildId, "-");
+        }
+        catch { }
     }
 
     /// <summary>Switches the visible page (used by the offscreen render probe).</summary>
@@ -2901,6 +3020,11 @@ internal class DshWindow : Window
             _idleBurstDone = false;
             return;
         }
+
+        // The turn is over, so any question of that session is settled too: a
+        // pending question blocks the turn, so a missing question/resolved frame
+        // (cancelled session, dropped client) must not leave a stale reminder.
+        ClearQuestionsOf(ev.SessionId);
 
         _turnBusy = false;
         string who = "第 " + ev.Turn + " 轮";
@@ -3092,6 +3216,16 @@ internal class DshWindow : Window
         Mux.Resolved += delegate(string approvalId)
         {
             Dispatcher.BeginInvoke(new Action(delegate { OnApprovalResolved(approvalId); }));
+        };
+        // The model asking the user to choose stops the turn just like an approval
+        // does, so it gets the same reminder (pet hold + sticky bubble + notice).
+        Mux.QuestionRequested += delegate(QuestionItem q)
+        {
+            Dispatcher.BeginInvoke(new Action(delegate { OnQuestionRequested(q); }));
+        };
+        Mux.QuestionResolved += delegate(string questionRpcId)
+        {
+            Dispatcher.BeginInvoke(new Action(delegate { OnQuestionResolved(questionRpcId); }));
         };
         Mux.StatusChanged += delegate
         {
