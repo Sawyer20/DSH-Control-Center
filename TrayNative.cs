@@ -144,12 +144,17 @@ internal sealed class NativeTray : IDisposable
     public void UpdateIconFromFile(string path)
     {
         if (path == null || path == _iconPath) return;
+        // Ask the icon for the frame the shell actually draws (16 px at 100%
+        // DPI, 24 px at 150%): new Icon(path) picks 32 px and lets Explorer
+        // downscale it, which is what made the whale look soft in the tray.
+        int size = TrayBadge.TraySize();
+        string key = path + "|" + size;
         System.Drawing.Icon ico;
-        if (!_icons.TryGetValue(path, out ico))
+        if (!_icons.TryGetValue(key, out ico))
         {
-            try { ico = new System.Drawing.Icon(path); }
+            try { ico = new System.Drawing.Icon(path, size, size); }
             catch { return; }
-            _icons[path] = ico;
+            _icons[key] = ico;
         }
         _iconPath = path;
         _nid.hIcon = ico.Handle;
@@ -230,6 +235,30 @@ internal static class TrayBadge
 
     [System.Runtime.InteropServices.DllImport("gdi32.dll")]
     private static extern IntPtr CreateBitmap(int nWidth, int nHeight, uint cPlanes, uint cBitCount, IntPtr lpvBits);
+
+    [System.Runtime.InteropServices.DllImport("gdi32.dll")]
+    private static extern IntPtr CreateDIBSection(IntPtr hdc, ref BITMAPV5HEADER bmi, uint usage, out IntPtr bits, IntPtr section, uint offset);
+
+    [System.Runtime.InteropServices.DllImport("user32.dll")]
+    private static extern IntPtr GetDC(IntPtr hwnd);
+
+    [System.Runtime.InteropServices.DllImport("user32.dll")]
+    private static extern int ReleaseDC(IntPtr hwnd, IntPtr hdc);
+
+    [System.Runtime.InteropServices.StructLayout(System.Runtime.InteropServices.LayoutKind.Sequential)]
+    private struct BITMAPV5HEADER
+    {
+        public int bV5Size; public int bV5Width; public int bV5Height;
+        public short bV5Planes; public short bV5BitCount;
+        public int bV5Compression; public int bV5SizeImage;
+        public int bV5XPelsPerMeter; public int bV5YPelsPerMeter;
+        public int bV5ClrUsed; public int bV5ClrImportant;
+        public int bV5RedMask; public int bV5GreenMask; public int bV5BlueMask;
+        public int bV5AlphaMask; public int bV5CSType;
+    }
+
+    private const int DIB_RGB_COLORS = 0;
+    private const int BI_BITFIELDS = 3;
 
     [System.Runtime.InteropServices.DllImport("user32.dll")]
     private static extern int GetSystemMetrics(int nIndex);
@@ -383,10 +412,42 @@ internal static class TrayBadge
 
     private static IntPtr ToHIcon(System.Drawing.Bitmap bmp)
     {
-        IntPtr hMask = CreateBitmap(bmp.Width, bmp.Height, 1, 1, IntPtr.Zero);
-        IntPtr hColor = bmp.GetHbitmap(System.Drawing.Color.FromArgb(0));
+        int w = bmp.Width, h = bmp.Height;
+        byte[] argb = ArgbBytes(bmp);
+        IntPtr hdc = IntPtr.Zero, hColor = IntPtr.Zero, hMask = IntPtr.Zero;
         try
         {
+            hdc = GetDC(IntPtr.Zero);
+            var v5 = new BITMAPV5HEADER();
+            v5.bV5Size = Marshal.SizeOf(typeof(BITMAPV5HEADER));
+            v5.bV5Width = w;
+            v5.bV5Height = -h;                       // top-down, like the source
+            v5.bV5Planes = 1;
+            v5.bV5BitCount = 32;
+            v5.bV5Compression = BI_BITFIELDS;
+            v5.bV5RedMask = 0x00FF0000;
+            v5.bV5GreenMask = 0x0000FF00;
+            v5.bV5BlueMask = 0x000000FF;
+            v5.bV5AlphaMask = unchecked((int)0xFF000000);
+            IntPtr bits;
+            hColor = CreateDIBSection(hdc, ref v5, DIB_RGB_COLORS, out bits, IntPtr.Zero, 0);
+            if (hColor == IntPtr.Zero) return IntPtr.Zero;
+            Marshal.Copy(argb, 0, bits, argb.Length);
+
+            // AND mask: 1 = see-through. A zero-filled mask says "opaque
+            // everywhere", which paints a black square around the whale in
+            // every path that composites through the mask instead of the alpha.
+            int stride = ((w + 31) / 32) * 4;
+            byte[] mask = new byte[stride * h];
+            for (int y = 0; y < h; y++)
+                for (int x = 0; x < w; x++)
+                    if (argb[(y * w + x) * 4 + 3] < 128)
+                        mask[y * stride + (x >> 3)] |= (byte)(0x80 >> (x & 7));
+            GCHandle pin = GCHandle.Alloc(mask, GCHandleType.Pinned);
+            try { hMask = CreateBitmap(w, h, 1, 1, pin.AddrOfPinnedObject()); }
+            finally { pin.Free(); }
+            if (hMask == IntPtr.Zero) return IntPtr.Zero;
+
             var ii = new ICONINFO();
             ii.fIcon = true;
             ii.hbmMask = hMask;
@@ -395,9 +456,27 @@ internal static class TrayBadge
         }
         finally
         {
-            if (hColor != IntPtr.Zero) DeleteObject(hColor);
             if (hMask != IntPtr.Zero) DeleteObject(hMask);
+            if (hColor != IntPtr.Zero) DeleteObject(hColor);
+            if (hdc != IntPtr.Zero) ReleaseDC(IntPtr.Zero, hdc);
         }
+    }
+
+    /// <summary>Packed top-down BGRA bytes of a 32bpp ARGB bitmap.</summary>
+    private static byte[] ArgbBytes(System.Drawing.Bitmap bmp)
+    {
+        var rect = new System.Drawing.Rectangle(0, 0, bmp.Width, bmp.Height);
+        var d = bmp.LockBits(rect, System.Drawing.Imaging.ImageLockMode.ReadOnly,
+            System.Drawing.Imaging.PixelFormat.Format32bppArgb);
+        try
+        {
+            int row = bmp.Width * 4;
+            byte[] buf = new byte[row * bmp.Height];
+            for (int y = 0; y < bmp.Height; y++)
+                Marshal.Copy(new IntPtr(d.Scan0.ToInt64() + (long)y * d.Stride), buf, y * row, row);
+            return buf;
+        }
+        finally { bmp.UnlockBits(d); }
     }
 
     internal static void Free()

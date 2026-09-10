@@ -31,7 +31,7 @@ echo Compiling DSH.exe (WPF, BuildId inside DSH.cs) ...
   /r:%FW%\WPF\WindowsBase.dll /r:%FW%\System.Xaml.dll ^
   /r:System.Drawing.dll /r:System.Management.dll /r:System.Web.Extensions.dll ^
   /r:%FW%\System.IO.Compression.dll /r:%FW%\System.IO.Compression.FileSystem.dll ^
-  "/out:%~dp0DSH.build.exe" "%~dp0DSH.cs" "%~dp0WpfUI.cs" "%~dp0TrayNative.cs" "%~dp0Win11Backdrop.cs" "%~dp0JobKill.cs" "%~dp0Usage.cs" "%~dp0Diagnostics.cs" "%~dp0Sessions.cs" "%~dp0Notifications.cs" "%~dp0Mux.cs" "%~dp0Backup.cs" "%~dp0PetScene.cs" "%~dp0PetWindow.cs"
+  "/out:%~dp0DSH.build.exe" "%~dp0DSH.cs" "%~dp0WpfUI.cs" "%~dp0TrayNative.cs" "%~dp0Win11Backdrop.cs" "%~dp0JobKill.cs" "%~dp0Usage.cs" "%~dp0Diagnostics.cs" "%~dp0Sessions.cs" "%~dp0Notifications.cs" "%~dp0Mux.cs" "%~dp0Backup.cs" "%~dp0PetScene.cs" "%~dp0PetWindow.cs" "%~dp0Settings.cs"
 if errorlevel 1 (
   echo.
   echo [ERROR] Compilation failed.

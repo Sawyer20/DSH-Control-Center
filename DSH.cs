@@ -37,7 +37,7 @@ using System.Management;
 internal static class Program
 {
     // Bump on EVERY source change (see 台账.md / README.md)
-    internal const string BuildId = "2026-09-02-47";
+    internal const string BuildId = "2026-09-02-51";
 
     internal const string Url = "http://127.0.0.1:3080";
     internal const int Port = 3080;

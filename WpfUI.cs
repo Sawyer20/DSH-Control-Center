@@ -1458,7 +1458,16 @@ internal class BackupView : UserControl
 // ============================================================================
 internal class PricingView : UserControl
 {
-    private TextBox _dayBudget, _monthBudget, _warnPct, _rate, _offStart, _offEnd;
+    private TextBox _dayBudget, _monthBudget, _warnPct;
+    private TextBox _modelIdBox;
+    private TextBlock _modelHint, _modelStatus, _declLabel;
+    private WrapPanel _declared;
+    private Border _imgSwitch, _imgThumb;
+    private bool _imgSupport;
+    // Peak = busy hours (Beijing time). Two editable ranges is exactly the
+    // backend's shape today (09:00-12:00 / 14:00-18:00 on weekdays); a row whose
+    // start or end is blank is simply ignored.
+    private TextBox _peak1Start, _peak1End, _peak2Start, _peak2End;
     private Border _weekendSwitch, _weekendThumb;
     private bool _weekend = true;
     private bool _suppress;
@@ -1468,9 +1477,65 @@ internal class PricingView : UserControl
     private readonly List<TextBox[]> _modelBoxes = new List<TextBox[]>();
     private readonly List<ModelPrice> _order = new List<ModelPrice>();
 
+    // Column contract: ONE list drives the header row, the editor order and the
+    // read-back order. They drifted apart once - values were laid out as
+    // In, Out, CacheRead while the headers read 输入未命中, 输入命中, 输出 - so
+    // the table showed 输入命中 = 4 元 and 输出 = 0.02 元 even though the cost
+    // maths used the correct 1 / 0.02 / 4. Never reorder one without the other.
+    internal static readonly string[] ColumnKeys = { "in", "cacheRead", "out", "cacheWrite", "peak" };
+    internal static readonly string[] ColumnTitles = { "输入未命中", "输入命中", "输出", "缓存写入", "峰值 ×" };
+
+    /// <summary>Test seam: the editor for one model row / column.</summary>
+    internal TextBox BoxAt(int row, int column)
+    {
+        if (row < 0 || row >= _modelBoxes.Count) return null;
+        TextBox[] boxes = _modelBoxes[row];
+        if (column < 0 || column >= boxes.Length) return null;
+        return boxes[column];
+    }
+
+    /// <summary>Test seam: number of model rows on screen.</summary>
+    internal int ModelRowCount { get { return _modelBoxes.Count; } }
+
+    private static double ValueOf(ModelPrice m, string key)
+    {
+        if (key == "in") return m.In;
+        if (key == "cacheRead") return m.CacheRead;
+        if (key == "out") return m.Out;
+        if (key == "cacheWrite") return m.CacheWrite;
+        return m.PeakMultiplier;
+    }
+
+    private static void SetValue(ModelPrice m, string key, double v)
+    {
+        if (key == "in") m.In = v;
+        else if (key == "cacheRead") m.CacheRead = v;
+        else if (key == "out") m.Out = v;
+        else if (key == "cacheWrite") m.CacheWrite = v;
+        else m.PeakMultiplier = v;
+    }
+
     public event EventHandler SettingsChanged;
     public event EventHandler<Pricing> PricingSaved;
     public event EventHandler DefaultsRequested;
+    /// <summary>Raised with true when costs should be recomputed with the current prices.</summary>
+    public event EventHandler<bool> RetroChanged;
+    /// <summary>Raised with the new model id after it reached the config file.</summary>
+    public event EventHandler<string> ModelIdChanged;
+
+    private Border _retroSwitch, _retroThumb;
+    private bool _retroOn = true;
+
+    /// <summary>Applies the persisted "recompute history with current prices" flag.</summary>
+    public void UpdateRetro(bool on)
+    {
+        _retroOn = on;
+        if (_retroSwitch == null) return;
+        _retroSwitch.Background = on ? WpfTheme.Accent : WpfTheme.SwitchOff;
+        _retroThumb.Background = on ? WpfTheme.PrimaryFill : WpfTheme.TextLight;
+        _retroThumb.HorizontalAlignment = on ? HorizontalAlignment.Right : HorizontalAlignment.Left;
+        _retroThumb.Margin = on ? new Thickness(0, 0, 3, 0) : new Thickness(3, 0, 0, 0);
+    }
 
     private sealed class Bar
     {
@@ -1507,6 +1572,27 @@ internal class PricingView : UserControl
         a.Children.Add(row);
         WireChange(_dayBudget); WireChange(_monthBudget); WireChange(_warnPct);
 
+        // ---- retroactive costing ----
+        a.Children.Add(new Border { Height = 14, Background = Brushes.Transparent });
+        var retroRow = new Grid();
+        retroRow.ColumnDefinitions.Add(new ColumnDefinition());
+        retroRow.ColumnDefinitions.Add(new ColumnDefinition { Width = GridLength.Auto });
+        var retroLb = new StackPanel();
+        retroLb.Children.Add(Ui.Tb("按当前定价重算历史成本", 12, WpfTheme.TextPrimary, FontWeights.SemiBold));
+        retroLb.Children.Add(Ui.Tb("开启：今日/近期/累计都用现在的价目表重算（改价不会让历史归零）；关闭：显示当时记账的金额", 11, WpfTheme.TextMuted));
+        retroRow.Children.Add(retroLb);
+        _retroSwitch = new Border { Width = 46, Height = 26, CornerRadius = new CornerRadius(13), BorderBrush = WpfTheme.BtnBorder, BorderThickness = new Thickness(1), Cursor = Cursors.Hand, VerticalAlignment = VerticalAlignment.Center };
+        _retroThumb = new Border { CornerRadius = new CornerRadius(10), Background = WpfTheme.PrimaryFill, Width = 20, Height = 20 };
+        _retroSwitch.Child = _retroThumb;
+        _retroSwitch.MouseLeftButtonUp += delegate
+        {
+            if (RetroChanged != null) RetroChanged(this, !_retroOn);
+        };
+        Grid.SetColumn(_retroSwitch, 1);
+        retroRow.Children.Add(_retroSwitch);
+        a.Children.Add(retroRow);
+        UpdateRetro(true);
+
         a.Children.Add(new Border { Height = 14, Background = Brushes.Transparent });
         _dayLine = Ui.Tb("今日 —", 12, WpfTheme.TextSecond);
         a.Children.Add(_dayLine);
@@ -1523,37 +1609,114 @@ internal class PricingView : UserControl
         st.Children.Add(cardA);
         st.Children.Add(new Border { Height = 14, Background = Brushes.Transparent });
 
+        // ---- frontend model (writes ~/.dsh/settings.yaml) ----
+        // One place to change both things at once: the id the backend calls and
+        // the row the price table is about. The backend watches its settings
+        // document (hot reload), so no restart is needed - but an EXISTING
+        // session keeps the model it already resolved.
+        var cardM = Ui.Card();
+        var m = new StackPanel();
+        m.Children.Add(Ui.Tb("前端模型 ID", 13, WpfTheme.TextSecond, FontWeights.SemiBold));
+        // This line is longer than the card: without wrapping WPF clips it at the
+        // right edge (caught by looking at the render, not by any assertion).
+        var mDesc = Ui.Tb("写进 ~/.dsh/settings.yaml 的 agent-default-model.model；后端热加载，"
+            + "新会话用新模型（已有会话仍用原模型，可在网页里为该会话切换）", 11, WpfTheme.TextMuted);
+        mDesc.TextWrapping = TextWrapping.Wrap;
+        m.Children.Add(mDesc);
+        m.Children.Add(new Border { Height = 12, Background = Brushes.Transparent });
+        var mrow = new StackPanel { Orientation = Orientation.Horizontal, VerticalAlignment = VerticalAlignment.Center };
+        _modelIdBox = NumBox(300);
+        _modelIdBox.FontFamily = new FontFamily("Consolas, Cascadia Mono, Microsoft YaHei UI");
+        // the switch must always describe the id that is typed, not the one that
+        // was loaded before it
+        _modelIdBox.TextChanged += delegate { RefreshDeclaredState(); };
+        var msave = Buttons.Primary("保存并生效", 108);
+        msave.Margin = new Thickness(10, 0, 0, 0);
+        msave.Click += delegate { SaveModelId(); };
+        _modelIdBox.KeyDown += delegate(object s, KeyEventArgs e)
+        {
+            if (e.Key == Key.Enter) SaveModelId();
+        };
+        mrow.Children.Add(_modelIdBox);
+        mrow.Children.Add(msave);
+        m.Children.Add(mrow);
+        m.Children.Add(new Border { Height = 10, Background = Brushes.Transparent });
+
+        // Image capability is a SEPARATE config leaf (llm-deepseek.models[].
+        // inputModalities): undeclared or text-only entries make the adapter
+        // refuse images outright, so the model id and its capability are saved
+        // together in one pass.
+        var imgRow = new StackPanel { Orientation = Orientation.Horizontal, VerticalAlignment = VerticalAlignment.Center };
+        _imgSwitch = new Border { Width = 46, Height = 26, CornerRadius = new CornerRadius(13), BorderBrush = WpfTheme.BtnBorder, BorderThickness = new Thickness(1), Cursor = Cursors.Hand, VerticalAlignment = VerticalAlignment.Center };
+        _imgThumb = new Border { CornerRadius = new CornerRadius(10), Background = WpfTheme.PrimaryFill, Width = 20, Height = 20 };
+        _imgSwitch.Child = _imgThumb;
+        _imgSwitch.MouseLeftButtonUp += delegate { SetImageSupport(!_imgSupport, true); };
+        imgRow.Children.Add(_imgSwitch);
+        imgRow.Children.Add(Lbl("该模型支持图片输入", 12, WpfTheme.TextPrimary, 10));
+        m.Children.Add(imgRow);
+        var imgHint = Ui.Tb("勾选后把当前 ID 声明为 text + image（写进 llm-deepseek.models；"
+            + "未声明的 ID 后端一律按纯文本处理）", 11, WpfTheme.TextMuted);
+        imgHint.TextWrapping = TextWrapping.Wrap;
+        imgHint.Margin = new Thickness(0, 6, 0, 0);
+        m.Children.Add(imgHint);
+        m.Children.Add(new Border { Height = 10, Background = Brushes.Transparent });
+        _modelStatus = Ui.Tb("", 11.5, WpfTheme.TextSecond);
+        _modelStatus.TextWrapping = TextWrapping.Wrap;
+        m.Children.Add(_modelStatus);
+        _modelHint = Ui.Tb("", 11, WpfTheme.TextMuted);
+        _modelHint.TextWrapping = TextWrapping.Wrap;
+        m.Children.Add(_modelHint);
+        m.Children.Add(new Border { Height = 8, Background = Brushes.Transparent });
+        var declRow = new StackPanel();                 // label, then a wrapped chip row
+        _declLabel = Ui.Tb("配置里已声明：", 11, WpfTheme.TextMuted);
+        declRow.Children.Add(_declLabel);
+        _declared = new WrapPanel { Orientation = Orientation.Horizontal, Margin = new Thickness(0, 4, 0, 0) };
+        declRow.Children.Add(_declared);
+        m.Children.Add(declRow);
+        cardM.Child = m;
+        st.Children.Add(cardM);
+        st.Children.Add(new Border { Height = 14, Background = Brushes.Transparent });
+
         // ---- pricing ----
         var cardB = Ui.Card();
         var b = new StackPanel();
-        b.Children.Add(Ui.Tb("定价（峰谷）", 13, WpfTheme.TextSecond, FontWeights.SemiBold));
-        b.Children.Add(Ui.Tb("USD / 1M tokens 的低谷价；高峰 = 低谷价 × 峰值倍数", 11, WpfTheme.TextMuted));
+        b.Children.Add(Ui.Tb("定价（峰谷，元）", 13, WpfTheme.TextSecond, FontWeights.SemiBold));
+        b.Children.Add(Ui.Tb("元 / 百万 tokens 的空闲价；高峰价 = 空闲价 × 峰值倍数", 11, WpfTheme.TextMuted));
         b.Children.Add(new Border { Height = 12, Background = Brushes.Transparent });
 
         var row2 = new StackPanel { Orientation = Orientation.Horizontal, VerticalAlignment = VerticalAlignment.Center };
-        _rate = NumBox(56);
-        _offStart = TextNumBox(56);
-        _offEnd = TextNumBox(56);
-        row2.Children.Add(Ui.Tb("汇率 USD→CNY", 12, WpfTheme.TextPrimary));
-        row2.Children.Add(_rate);
-        row2.Children.Add(Lbl("低谷时段", 12, WpfTheme.TextPrimary, 18));
-        row2.Children.Add(_offStart);
+        _peak1Start = TextNumBox(56);
+        _peak1End = TextNumBox(56);
+        _peak2Start = TextNumBox(56);
+        _peak2End = TextNumBox(56);
+        row2.Children.Add(Ui.Tb("高峰时段", 12, WpfTheme.TextPrimary));
+        row2.Children.Add(_peak1Start);
         row2.Children.Add(Lbl("→", 11, WpfTheme.TextMuted, 6));
-        row2.Children.Add(_offEnd);
-        row2.Children.Add(Lbl("周末全低谷", 12, WpfTheme.TextPrimary, 18));
+        row2.Children.Add(_peak1End);
+        row2.Children.Add(Lbl("、", 11, WpfTheme.TextMuted, 10));
+        row2.Children.Add(_peak2Start);
+        row2.Children.Add(Lbl("→", 11, WpfTheme.TextMuted, 6));
+        row2.Children.Add(_peak2End);
+        row2.Children.Add(Lbl("周末不计高峰", 12, WpfTheme.TextPrimary, 18));
         _weekendSwitch = new Border { Width = 46, Height = 26, CornerRadius = new CornerRadius(13), BorderBrush = WpfTheme.BtnBorder, BorderThickness = new Thickness(1), Cursor = Cursors.Hand, VerticalAlignment = VerticalAlignment.Center };
         _weekendThumb = new Border { CornerRadius = new CornerRadius(10), Background = WpfTheme.PrimaryFill, Width = 20, Height = 20 };
         _weekendSwitch.Child = _weekendThumb;
         _weekendSwitch.MouseLeftButtonUp += delegate { SetWeekend(!_weekend, true); };
         row2.Children.Add(_weekendSwitch);
         b.Children.Add(row2);
-        WireChange(_rate); WireChange(_offStart); WireChange(_offEnd);
+        b.Children.Add(Ui.Tb("北京时间；仅工作日生效，其余时段（含午休 12:00–14:00、夜间、周末）都按空闲价", 11, WpfTheme.TextMuted));
+        WireChange(_peak1Start); WireChange(_peak1End);
+        WireChange(_peak2Start); WireChange(_peak2End);
+        // keep the two rows readable at once without them jumping around
+        _peak1Start.Width = 52; _peak1End.Width = 52; _peak2Start.Width = 52; _peak2End.Width = 52;
 
         b.Children.Add(new Border { Height = 14, Background = Brushes.Transparent });
         var head = new Grid();
         head.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(190) });
         for (int i = 0; i < 5; i++) head.ColumnDefinitions.Add(new ColumnDefinition());
-        string[] titles = { "模型", "输入", "输出", "缓存读", "缓存写", "峰值 ×" };
+        string[] titles = new string[ColumnTitles.Length + 1];
+        titles[0] = "模型（元 / 百万）";
+        Array.Copy(ColumnTitles, 0, titles, 1, ColumnTitles.Length);
         for (int i = 0; i < titles.Length; i++)
         {
             var t = Ui.Tb(titles[i], 10.5, WpfTheme.TextLight);
@@ -1661,6 +1824,124 @@ internal class PricingView : UserControl
         };
     }
 
+    /// <summary>
+    /// Fills the model card from the harness settings document. The config file
+    /// is the source of truth for the frontend model; the price table row is
+    /// only a label, so a mismatch is reported instead of silently ignored.
+    /// </summary>
+    public void LoadModelId(string id, IList<string> declared, string reasoningEffort,
+        string pricingRowId, bool imageSupport)
+    {
+        _suppress = true;
+        try
+        {
+            _modelIdBox.Text = id == null ? "" : id;
+            SetImageSupport(imageSupport, false);
+            _declared.Children.Clear();
+            _declLabel.Visibility = (declared != null && declared.Count > 0)
+                ? Visibility.Visible : Visibility.Collapsed;
+            if (declared != null && declared.Count > 0)
+            {
+                foreach (string d in declared)
+                {
+                    string captured = d;
+                    var chip = Ui.Tb(d, 11, WpfTheme.Accent);
+                    chip.Margin = new Thickness(0, 0, 12, 4);
+                    chip.Cursor = Cursors.Hand;
+                    chip.ToolTip = "点一下填入";
+                    chip.MouseLeftButtonUp += delegate
+                    {
+                        _modelIdBox.Text = captured;
+                        SetModelStatus("已填入 " + captured + "，点「保存并生效」写入配置。", false);
+                    };
+                    _declared.Children.Add(chip);
+                }
+            }
+            else
+            {
+                _declared.Children.Add(Ui.Tb("（未声明自定义模型清单，直接用提供方目录）", 11, WpfTheme.TextMuted));
+            }
+            string hint = "配置里当前：" + (id != null && id.Length > 0 ? id : "未设置");
+            if (!String.IsNullOrEmpty(reasoningEffort)) hint += "（reasoningEffort: " + reasoningEffort + "）";
+            hint += "；图片输入：" + (imageSupport ? "已声明 text + image" : "未声明（纯文本）");
+            if (pricingRowId != null && pricingRowId.Length > 0 && id != null
+                && !String.Equals(pricingRowId, id, StringComparison.Ordinal))
+                hint += "；价目表行名是 " + pricingRowId + "，保存后会一起改成配置里的 ID";
+            _modelHint.Text = hint;
+            SetModelStatus("", false);
+        }
+        finally { _suppress = false; }
+    }
+
+    /// <summary>Test seam: the model id currently shown in the box.</summary>
+    internal string ModelIdShown { get { return _modelIdBox == null ? "" : _modelIdBox.Text; } }
+    /// <summary>Test seam: the status line under the model box.</summary>
+    internal string ModelStatusShown { get { return _modelStatus == null ? "" : _modelStatus.Text; } }
+    /// <summary>Test seam: the hint line (config value, reasoningEffort, row-name drift).</summary>
+    internal string ModelHintShown { get { return _modelHint == null ? "" : _modelHint.Text; } }
+    /// <summary>Test seam: how many declared model ids are offered as chips.</summary>
+    internal int DeclaredChipCount { get { return _declared == null ? 0 : _declared.Children.Count; } }
+    /// <summary>Test seam: the image-input switch state.</summary>
+    internal bool ImageSupportShown { get { return _imgSupport; } }
+
+    /// <summary>Paints the image-input switch (same shape as the weekend switch).</summary>
+    public void SetImageSupport(bool on, bool notify)
+    {
+        _imgSupport = on;
+        _imgSwitch.Background = on ? WpfTheme.Accent : WpfTheme.SwitchOff;
+        _imgThumb.Background = on ? WpfTheme.PrimaryFill : WpfTheme.TextLight;
+        _imgThumb.HorizontalAlignment = on ? HorizontalAlignment.Right : HorizontalAlignment.Left;
+        _imgThumb.Margin = on ? new Thickness(0, 0, 3, 0) : new Thickness(3, 0, 0, 0);
+        if (notify) SetModelStatus("图片输入已" + (on ? "开启" : "关闭") + "，点「保存并生效」写入配置。", false);
+    }
+
+    private void SetModelStatus(string text, bool bad)
+    {
+        _modelStatus.Text = text;
+        _modelStatus.Foreground = bad ? WpfTheme.Danger : WpfTheme.Accent;
+    }
+
+    internal void SaveModelId()
+    {
+        string want = _modelIdBox.Text == null ? "" : _modelIdBox.Text.Trim();
+        bool declaredBefore = false, imageBefore = false;
+        try
+        {
+            List<string> ids = HarnessSettings.DeclaredModels();
+            for (int i = 0; i < ids.Count; i++)
+                if (String.Equals(ids[i], want, StringComparison.OrdinalIgnoreCase)) declaredBefore = true;
+            imageBefore = HarnessSettings.DeclaresImage(want);
+        }
+        catch { }
+
+        string err;
+        if (!HarnessSettings.ApplyModel(want, _imgSupport, out err))
+        {
+            SetModelStatus(err, true);
+            return;
+        }
+
+        string cap;
+        if (_imgSupport && !declaredBefore) cap = "；已在 llm-deepseek.models 新增该条目并声明 text + image";
+        else if (_imgSupport && !imageBefore) cap = "；已把该条目改声明为 text + image";
+        else if (_imgSupport) cap = "；图片输入已声明（text + image）";
+        else if (declaredBefore) cap = "；该条目已改为纯文本（text）";
+        else cap = "；该 ID 未在清单里，默认即纯文本";
+        SetModelStatus("已写入 " + HarnessSettings.FilePath + "（后端热加载，新会话生效）" + cap, false);
+        if (ModelIdChanged != null) ModelIdChanged(this, want);
+    }
+
+    /// <summary>
+    /// Re-reads the capability of whatever id is typed in the box, so the switch
+    /// always shows what the document says about THAT id.
+    /// </summary>
+    public void RefreshDeclaredState()
+    {
+        if (_suppress) return;
+        try { SetImageSupport(HarnessSettings.DeclaresImage(_modelIdBox.Text.Trim()), false); }
+        catch { }
+    }
+
     /// <summary>Fills the form from the persisted pricing + budget values.</summary>
     public void Load(Pricing p, double dayBudget, double monthBudget, double warnPct)
     {
@@ -1672,10 +1953,13 @@ internal class PricingView : UserControl
             _warnPct.Text = ((int)Math.Round(warnPct)).ToString();
             if (p != null)
             {
-                _rate.Text = p.UsdToCny.ToString("0.##", System.Globalization.CultureInfo.InvariantCulture);
-                _offStart.Text = p.OffPeakStart;
-                _offEnd.Text = p.OffPeakEnd;
-                SetWeekend(p.WeekendAllOffPeak, false);
+                PeakWindow w1 = p.PeakWindows.Count > 0 ? p.PeakWindows[0] : new PeakWindow("", "");
+                PeakWindow w2 = p.PeakWindows.Count > 1 ? p.PeakWindows[1] : new PeakWindow("", "");
+                _peak1Start.Text = w1.Start;
+                _peak1End.Text = w1.End;
+                _peak2Start.Text = w2.Start;
+                _peak2End.Text = w2.End;
+                SetWeekend(p.WeekendsOffPeak, false);
                 BuildModels(p);
             }
         }
@@ -1698,15 +1982,11 @@ internal class PricingView : UserControl
             name.ToolTip = m.Id;
             name.VerticalAlignment = VerticalAlignment.Center;
             row.Children.Add(name);
-            var boxes = new TextBox[5];
-            string[] vals =
-            {
-                Fmt(m.In), Fmt(m.Out), Fmt(m.CacheRead), Fmt(m.CacheWrite), Fmt(m.PeakMultiplier)
-            };
-            for (int i = 0; i < 5; i++)
+            var boxes = new TextBox[ColumnKeys.Length];
+            for (int i = 0; i < ColumnKeys.Length; i++)
             {
                 var tb = TextNumBox(74);
-                tb.Text = vals[i];
+                tb.Text = Fmt(ValueOf(m, ColumnKeys[i]));
                 tb.FontSize = 11.5;
                 tb.Margin = new Thickness(0, 0, 8, 0);
                 Grid.SetColumn(tb, i + 1);
@@ -1763,27 +2043,50 @@ internal class PricingView : UserControl
     {
         error = "";
         var p = new Pricing();
-        p.UsdToCny = Read(_rate);
-        if (p.UsdToCny <= 0) { error = "汇率必须大于 0"; return null; }
-        p.OffPeakStart = _offStart.Text.Trim();
-        p.OffPeakEnd = _offEnd.Text.Trim();
-        p.WeekendAllOffPeak = _weekend;
+        AddPeak(p, _peak1Start.Text, _peak1End.Text, out error);
+        if (error.Length > 0) return null;
+        AddPeak(p, _peak2Start.Text, _peak2End.Text, out error);
+        if (error.Length > 0) return null;
+        p.WeekendsOffPeak = _weekend;
         for (int i = 0; i < _order.Count; i++)
         {
             TextBox[] boxes = _modelBoxes[i];
             ModelPrice m = _order[i];
             var nm = new ModelPrice();
             nm.Id = m.Id;
-            nm.In = Read(boxes[0]);
-            nm.Out = Read(boxes[1]);
-            nm.CacheRead = Read(boxes[2]);
-            nm.CacheWrite = Read(boxes[3]);
-            nm.PeakMultiplier = Read(boxes[4]);
+            for (int c = 0; c < ColumnKeys.Length; c++) SetValue(nm, ColumnKeys[c], Read(boxes[c]));
             if (nm.PeakMultiplier <= 0) nm.PeakMultiplier = 2.0;
             p.Models.Add(nm);
         }
-        p.DefaultModel = p.Models.Count > 0 ? p.Models[0].Id : "deepseek-v4-flash";
+        p.DefaultModel = p.Models.Count > 0 ? p.Models[0].Id : "deepseek-flash";
         return p;
+    }
+
+    /// <summary>
+    /// Adds one edited peak range. A row with both boxes empty is skipped (the
+    /// second row is optional); a half-filled or malformed row is an error, not
+    /// a silent "peak never happens".
+    /// </summary>
+    private static void AddPeak(Pricing p, string start, string end, out string error)
+    {
+        error = "";
+        string s = start == null ? "" : start.Trim();
+        string e = end == null ? "" : end.Trim();
+        if (s.Length == 0 && e.Length == 0) return;
+        if (!IsHm(s) || !IsHm(e))
+        {
+            error = "高峰时段要写成 HH:mm（例：09:00 → 12:00）；不需要第二段就留空。";
+            return;
+        }
+        p.PeakWindows.Add(new PeakWindow(s, e));
+    }
+
+    private static bool IsHm(string s)
+    {
+        if (s == null || s.Length != 5 || s[2] != ':') return false;
+        int h, m;
+        if (!Int32.TryParse(s.Substring(0, 2), out h) || !Int32.TryParse(s.Substring(3, 2), out m)) return false;
+        return h >= 0 && h <= 24 && m >= 0 && m <= 59;
     }
 
     private void Save()
@@ -2037,7 +2340,7 @@ internal class SidebarView : UserControl
         AddNav("总览", "overview");
         AddNav("服务", "service");
         AddNav("用量", "usage");
-        AddNav("预算", "budget");
+        AddNav("模型与成本", "budget");
         AddNav("通知", "notifications");
         AddNav("会话", "sessions");
         AddNav("备份", "backups");
@@ -2110,6 +2413,7 @@ internal class DshWindow : Window
     private BackupView _backups;
     private int _backupKeep = 5;
     private bool _backupCreds;                 // default OFF: never back up the API key
+    private bool _costRetro = true;            // recompute history with current prices
     private PricingView _pricingView;
     private NotificationsView _notices;
     private ApprovalsView _approvalsView;
@@ -2160,6 +2464,14 @@ internal class DshWindow : Window
         MinWidth = 880;
         MinHeight = 620;
         WindowStyle = WindowStyle.None;
+        // A caption-less WPF window still carries WS_THICKFRAME, and WPF never
+        // paints the non-client band that comes with it: the light window was
+        // framed by a ~7 DIP strip of raw black (#000000 on the sides, #2B2B2B
+        // on top - the stale "immersive dark mode" frame colour), so the page
+        // looked shifted inside a black frame. WindowChrome makes the client
+        // cover the entire window rect (WPF paints every pixel) while its
+        // WM_NCHITTEST hook keeps the resize borders working.
+        ApplyWindowChrome();
         AllowsTransparency = false;              // hardware rendering: crisp text
         Background = WpfTheme.WindowBg;          // opaque fallback when Mica is unavailable
         FontFamily = WpfTheme.Ui;
@@ -2219,17 +2531,24 @@ internal class DshWindow : Window
         if (_backupKeep < 1) _backupKeep = 1;
         if (_backupKeep > 20) _backupKeep = 20;
         _backupCreds = Program.LoadUiSetting("backupCreds", "0").Equals("1", StringComparison.OrdinalIgnoreCase);
+        _costRetro = !Program.LoadUiSetting("costRetro", "1").Equals("0", StringComparison.OrdinalIgnoreCase);
         // BuildChrome() pushed the FIELD DEFAULTS into the settings UI before
         // these values were read; re-push the persisted ones or every launch
         // silently shows (and would then save) the defaults.
-        _settings.UpdatePet(_petEnabled);
-        _settings.UpdatePetSettings(_petRate, _petBusy);
-        _settings.UpdateBackupKeep(_backupKeep);
-        if (_backups != null) _backups.UpdateCredentials(_backupCreds);
         _budgetDay = ParseDouble(Program.LoadUiSetting("budgetDay", "0"), 0);
         _budgetMonth = ParseDouble(Program.LoadUiSetting("budgetMonth", "0"), 0);
         _budgetWarn = ParseDouble(Program.LoadUiSetting("budgetWarn", "80"), 80);
         try { _pricing = Usage.LoadPricing(); } catch { _pricing = Usage.DefaultPricing(); }
+        _settings.UpdatePet(_petEnabled);
+        _settings.UpdatePetSettings(_petRate, _petBusy);
+        _settings.UpdateBackupKeep(_backupKeep);
+        if (_backups != null) _backups.UpdateCredentials(_backupCreds);
+        if (_pricingView != null)
+        {
+            _pricingView.UpdateRetro(_costRetro);
+            _pricingView.Load(_pricing, _budgetDay, _budgetMonth, _budgetWarn);
+            RefreshModelCard();
+        }
         ApplyPet();
         Notifications.MarkLegacyApprovalRead();    // one-off: old approval notices had no refId
         LoadNotifications();
@@ -2253,12 +2572,44 @@ internal class DshWindow : Window
     }
 
     private bool _micaOk;
+    private Grid _captionBar;
+
+    /// <summary>Test seam: the 48px caption strip (must stay hit-testable).</summary>
+    internal Grid CaptionBar { get { return _captionBar; } }
+
+    /// <summary>
+    /// Borderless window without the unpainted non-client band (see the ctor).
+    /// CaptionHeight = 0 keeps dragging ours (the strip calls DragMove), and
+    /// ResizeBorderThickness keeps the window edges resizable.
+    /// </summary>
+    private void ApplyWindowChrome()
+    {
+        try
+        {
+            var chrome = new System.Windows.Shell.WindowChrome();
+            chrome.CaptionHeight = 0;
+            chrome.ResizeBorderThickness = new Thickness(6);
+            // Sheet of glass (-1): the DWM keeps drawing the Mica backdrop behind
+            // the transparent base layer in dark mode. 0 would cut the window off
+            // from the compositor backdrop instead. Our content is opaque except
+            // for the base layer, so nothing else changes.
+            chrome.GlassFrameThickness = new Thickness(-1);
+            chrome.CornerRadius = new CornerRadius(0);
+            chrome.UseAeroCaptionButtons = false;
+            System.Windows.Shell.WindowChrome.SetWindowChrome(this, chrome);
+        }
+        catch { }
+    }
 
     // Mica is dark-mode only on purpose: a translucent light base layer over a
     // blurred desktop turns grey, which is what made the light theme look muddy.
     private void ApplyBackdrop()
     {
         bool dark = WpfTheme.IsDark;
+        // Win11Backdrop.Apply() always asks for the dark chrome; without this
+        // the DWM kept painting a dark frame and system menus around a LIGHT
+        // window for the whole session (theme switches only fire later).
+        Win11Backdrop.SetDarkMode(this, dark);
         Win11Backdrop.SetBackdrop(this, dark && _micaOk);
         Background = (dark && _micaOk) ? Brushes.Transparent : WpfTheme.WindowBg;
     }
@@ -2310,11 +2661,14 @@ internal class DshWindow : Window
             List<UsageTick> hist = Usage.ReadHistory();
             double h1, h3, h6;
             long t1, t3, t6;
-            Usage.Window(hist, 1, out h1, out t1);
-            Usage.Window(hist, 3, out h3, out t3);
-            Usage.Window(hist, 6, out h6, out t6);
-            double today = Usage.Today(hist);
-            double month = Usage.Since(hist, Usage.MonthStart());
+            Usage.Window(hist, 1, _pricing, _costRetro, out h1, out t1);
+            Usage.Window(hist, 3, _pricing, _costRetro, out h3, out t3);
+            Usage.Window(hist, 6, _pricing, _costRetro, out h6, out t6);
+            double today = Usage.Today(hist, _pricing, _costRetro);
+            double month = Usage.Since(hist, Usage.MonthStart(), _pricing, _costRetro);
+            // In retroactive mode the all-time figure comes from the session
+            // totals (which are cumulative), so it reflects the CURRENT prices.
+            double lifetimeCost = _costRetro ? Usage.ComputeCosts(_pricing, sessions) : life.Cost;
             _ratePerHour = h1;
 
             long inTok = 0, outTok = 0, crTok = 0;
@@ -2331,12 +2685,12 @@ internal class DshWindow : Window
             string eta = "—";
             if (_ratePerHour > 0.0001 && _lastBalanceTotal > 0m)
             {
-                double usd = (double)_lastBalanceTotal / (_pricing.UsdToCny <= 0 ? 7.2 : _pricing.UsdToCny);
-                double hours = usd / _ratePerHour;
+                double cny = (double)_lastBalanceTotal;
+                double hours = cny / _ratePerHour;
                 eta = hours >= 48 ? ((int)(hours / 24)) + " 天" : (hours >= 1 ? ((int)hours) + " 小时" : "< 1 小时");
             }
             foreach (BalanceView v in _balViews)
-                v.SetCost(Usage.Money(today, _pricing), Usage.Money(h1, _pricing), Usage.Money(life.Cost, _pricing), life.Days, eta);
+                v.SetCost(Usage.Money(today, _pricing), Usage.Money(h1, _pricing), Usage.Money(lifetimeCost, _pricing), life.Days, eta);
 
             EvaluateBudget(today, month);
         }
@@ -2425,6 +2779,22 @@ internal class DshWindow : Window
         if (String.IsNullOrEmpty(s)) return "";
         s = s.Replace("\r", " ").Replace("\n", " ").Trim();
         return s.Length <= max ? s : s.Substring(0, max) + "…";
+    }
+
+    /// <summary>
+    /// Pushes the harness settings document (~/.dsh/settings.yaml) into the
+    /// model card. That document is the source of truth for the frontend model.
+    /// </summary>
+    private void RefreshModelCard()
+    {
+        if (_pricingView == null) return;
+        try
+        {
+            string rowId = (_pricing != null && _pricing.Models.Count > 0) ? _pricing.Models[0].Id : "";
+            _pricingView.LoadModelId(HarnessSettings.ModelId, HarnessSettings.DeclaredModels(),
+                HarnessSettings.ReasoningEffort, rowId, HarnessSettings.DeclaresImage(HarnessSettings.ModelId));
+        }
+        catch { }
     }
 
     /// <summary>Pushes spend vs budget to the 预算 page and alerts on crossings.</summary>
@@ -2642,7 +3012,12 @@ internal class DshWindow : Window
         var main = new Grid();
         main.RowDefinitions.Add(new RowDefinition { Height = new GridLength(48) });
         main.RowDefinitions.Add(new RowDefinition());
-        var bar = new Grid();
+        // A Panel with a null Background is NOT hit-testable in WPF, so this
+        // strip used to swallow nothing: the only draggable pixels of the whole
+        // window were the two caption buttons. Transparent makes the full 48px
+        // strip a drag handle again (Windows-style: grab the top edge).
+        _captionBar = new Grid { Background = Brushes.Transparent };
+        var bar = _captionBar;
         bar.MouseLeftButtonDown += delegate(object s, MouseButtonEventArgs e) { if (e.LeftButton == MouseButtonState.Pressed) DragMove(); };
         var caps = new StackPanel { Orientation = Orientation.Horizontal, HorizontalAlignment = HorizontalAlignment.Right, VerticalAlignment = VerticalAlignment.Center, Margin = new Thickness(0, 0, 12, 0) };
         var minB = CaptionButton("—");
@@ -2755,6 +3130,22 @@ internal class DshWindow : Window
         _pricingView = new PricingView();
         if (_pricing == null) { try { _pricing = Usage.LoadPricing(); } catch { _pricing = Usage.DefaultPricing(); } }
         _pricingView.Load(_pricing, _budgetDay, _budgetMonth, _budgetWarn);
+        RefreshModelCard();
+        _pricingView.ModelIdChanged += delegate(object s, string id)
+        {
+            // The price table's row name follows the model the backend actually
+            // calls, so "the row I price" and "the model I use" cannot drift.
+            try
+            {
+                if (_pricing.Models.Count > 0) _pricing.Models[0].Id = id;
+                _pricing.DefaultModel = id;
+                Usage.SavePricing(_pricing);
+            }
+            catch { }
+            _pricingView.Load(_pricing, _budgetDay, _budgetMonth, _budgetWarn);
+            RefreshModelCard();
+            RefreshUsageCost();
+        };
         _pricingView.SettingsChanged += delegate
         {
             _budgetDay = _pricingView.DayBudget;
@@ -2765,13 +3156,21 @@ internal class DshWindow : Window
             Program.SaveUiSetting("budgetWarn", ((int)Math.Round(_budgetWarn)).ToString());
             RefreshUsageCost();
         };
+        _pricingView.UpdateRetro(_costRetro);
+        _pricingView.RetroChanged += delegate(object s, bool on)
+        {
+            _costRetro = on;
+            Program.SaveUiSetting("costRetro", on ? "1" : "0");
+            _pricingView.UpdateRetro(on);
+            RefreshUsageCost();
+        };
         _pricingView.PricingSaved += delegate(object s, Pricing p)
         {
             Usage.SavePricing(p);
             _pricing = p;
             _pricingView.Load(_pricing, _budgetDay, _budgetMonth, _budgetWarn);
             RefreshUsageCost();
-            PushEvent("定价已保存", p.Models.Count + " 个模型 · 汇率 " + p.UsdToCny.ToString("0.##", System.Globalization.CultureInfo.InvariantCulture), WpfTheme.Success);
+            PushEvent("定价已保存", p.Models.Count + " 个模型 · 元/百万 tokens", WpfTheme.Success);
         };
         _pricingView.DefaultsRequested += delegate
         {
@@ -2779,7 +3178,6 @@ internal class DshWindow : Window
                 MessageBoxButton.YesNo, MessageBoxImage.Warning, MessageBoxResult.No);
             if (ans != MessageBoxResult.Yes) return;
             Pricing def = Usage.DefaultPricing();
-            def.UsdToCny = _pricing != null && _pricing.UsdToCny > 0 ? _pricing.UsdToCny : def.UsdToCny;
             Usage.SavePricing(def);
             _pricing = def;
             _pricingView.Load(_pricing, _budgetDay, _budgetMonth, _budgetWarn);
@@ -2907,7 +3305,7 @@ internal class DshWindow : Window
         // ---- budget page ----
         var pageBudget = new UserControl();
         var pBu = new StackPanel { Margin = new Thickness(0, 6, 0, 0) };
-        pBu.Children.Add(Ui.Tb("预算与定价", 22, WpfTheme.TitleText, FontWeights.SemiBold, WpfTheme.UiDisplay));
+        pBu.Children.Add(Ui.Tb("模型与成本", 22, WpfTheme.TitleText, FontWeights.SemiBold, WpfTheme.UiDisplay));
         pBu.Children.Add(new Border { Height = 12, Background = Brushes.Transparent });
         pBu.Children.Add(_pricingView);
         pageBudget.Content = pBu;
@@ -3464,7 +3862,7 @@ internal class DshWindow : Window
             items.Add(TrayMenuItem.Sep());
             items.Add(Item("日志", delegate { ShowPage("logs"); ShowConsole(); }));
             items.Add(Item("通知", delegate { ShowPage("notifications"); ShowConsole(); }));
-            items.Add(Item("预算与定价", delegate { ShowPage("budget"); ShowConsole(); }));
+            items.Add(Item("模型与成本", delegate { ShowPage("budget"); ShowConsole(); }));
             items.Add(Item("会话库", delegate { ShowPage("sessions"); ShowConsole(); }));
             items.Add(Item("备份历史", delegate { ShowPage("backups"); ShowConsole(); }));
             items.Add(Item("生成诊断包", delegate { CreateDiagnostics(); }));

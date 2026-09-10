@@ -60,20 +60,39 @@ internal sealed class Lifetime
 internal sealed class ModelPrice
 {
     public string Id = "";
-    public double In;            // USD per 1M tokens (off-peak)
-    public double Out;
-    public double CacheRead;
-    public double CacheWrite;
+    public double In;            // 元 / 1M tokens, cache MISS input (off-peak)
+    public double CacheRead;     // 元 / 1M tokens, cache HIT input (off-peak)
+    public double Out;           // 元 / 1M tokens output (off-peak)
+    public double CacheWrite;    // 元 / 1M tokens cache write (off-peak)
     public double PeakMultiplier = 2.0;
+}
+
+/// <summary>One peak (busy-hours) range, "HH:mm" Beijing time, [start, end).</summary>
+internal sealed class PeakWindow
+{
+    public string Start = "09:00";
+    public string End = "12:00";
+
+    public PeakWindow() { }
+    public PeakWindow(string start, string end) { Start = start; End = end; }
 }
 
 internal sealed class Pricing
 {
-    public string DefaultModel = "deepseek-v4-flash";
-    public double UsdToCny = 7.2;
-    public string OffPeakStart = "00:30";   // Beijing time
-    public string OffPeakEnd = "08:30";
-    public bool WeekendAllOffPeak = true;
+    /// <summary>Bumped when the on-disk shape changes (2 = 元 + no USD rate, 3 = peak windows).</summary>
+    public const int CurrentVersion = 3;
+
+    public int Version = CurrentVersion;
+    public string DefaultModel = "deepseek-flash";
+    /// <summary>
+    /// Busy hours in BEIJING time. Everything outside them is off-peak, so the
+    /// lunch break (12:00-14:00), the evening and the night are off-peak too -
+    /// this is a PEAK list, not a single off-peak window. The user's rule:
+    /// 周一至周五 09:00-12:00、14:00-18:00.
+    /// </summary>
+    public readonly List<PeakWindow> PeakWindows = new List<PeakWindow>();
+    /// <summary>Weekends never count as peak (the rule only mentions Mon-Fri).</summary>
+    public bool WeekendsOffPeak = true;
     public readonly List<ModelPrice> Models = new List<ModelPrice>();
 
     public ModelPrice Find(string id)
@@ -85,15 +104,25 @@ internal sealed class Pricing
         return Models.Count > 0 ? Models[0] : new ModelPrice();
     }
 
-    /// <summary>True when the given local time falls in the off-peak window.</summary>
-    public bool IsOffPeak(DateTime t)
+    /// <summary>True when the given local (Beijing) time is inside a peak window.</summary>
+    public bool IsPeak(DateTime t)
     {
-        if (WeekendAllOffPeak && (t.DayOfWeek == DayOfWeek.Saturday || t.DayOfWeek == DayOfWeek.Sunday)) return true;
-        TimeSpan start, end, now = t.TimeOfDay;
-        if (!TryParseHm(OffPeakStart, out start) || !TryParseHm(OffPeakEnd, out end)) return false;
-        if (start <= end) return now >= start && now < end;
-        return now >= start || now < end;      // window crosses midnight
+        if (WeekendsOffPeak && (t.DayOfWeek == DayOfWeek.Saturday || t.DayOfWeek == DayOfWeek.Sunday)) return false;
+        TimeSpan now = t.TimeOfDay, start, end;
+        for (int i = 0; i < PeakWindows.Count; i++)
+        {
+            if (!TryParseHm(PeakWindows[i].Start, out start) || !TryParseHm(PeakWindows[i].End, out end)) continue;
+            if (start <= end)
+            {
+                if (now >= start && now < end) return true;
+            }
+            else if (now >= start || now < end) return true;      // window crosses midnight
+        }
+        return false;
     }
+
+    /// <summary>True when the given local (Beijing) time is off-peak (cheap).</summary>
+    public bool IsOffPeak(DateTime t) { return !IsPeak(t); }
 
     private static bool TryParseHm(string s, out TimeSpan ts)
     {
@@ -102,6 +131,7 @@ internal sealed class Pricing
         string[] p = s.Split(':');
         int h, m;
         if (p.Length != 2 || !Int32.TryParse(p[0], out h) || !Int32.TryParse(p[1], out m)) return false;
+        if (h < 0 || h > 24 || m < 0 || m > 59) return false;
         ts = new TimeSpan(h, m, 0);
         return true;
     }
@@ -126,7 +156,20 @@ internal static class Usage
     {
         get { return Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "DSH"); }
     }
-    public static string PricingFile { get { return Path.Combine(DataDir, "pricing.json"); } }
+    /// <summary>
+    /// Test seam (probes only): point the price list at another file. Without it
+    /// a smoke run would read - and migrate - the user's real pricing.json.
+    /// </summary>
+    internal static string OverridePricingFile = "";
+    public static string PricingFile
+    {
+        get
+        {
+            return OverridePricingFile.Length > 0
+                ? OverridePricingFile
+                : Path.Combine(DataDir, "pricing.json");
+        }
+    }
     public static string HistoryFile { get { return Path.Combine(DataDir, "usage-history.jsonl"); } }
     public static string StateFile { get { return Path.Combine(DataDir, "usage-state.json"); } }
 
@@ -263,15 +306,52 @@ internal static class Usage
                 return seed;
             }
             var ser = new JavaScriptSerializer();
-            var root = ser.DeserializeObject(File.ReadAllText(PricingFile, Encoding.UTF8)) as Dictionary<string, object>;
-            var p = DefaultPricing();
-            if (root == null) return p;
+            Dictionary<string, object> root = null;
+            try { root = ser.DeserializeObject(File.ReadAllText(PricingFile, Encoding.UTF8)) as Dictionary<string, object>; }
+            catch { root = null; }
+            if (root == null) return RecoverPricing();
             object v;
+            // v1 files priced everything in USD with a usdToCny multiplier; that
+            // made every historical amount break whenever the rate changed, so
+            // v2 is 元-denominated and old files are replaced by the defaults.
+            // v3 replaced the single off-peak window with a peak-window list and
+            // dropped the retired model rows - the money is carried over.
+            int version = 0;
+            if (root.TryGetValue("version", out v) && v != null) { try { version = (int)ToL(v); } catch { } }
+            if (version < 2)
+            {
+                Pricing replaced = DefaultPricing();
+                SavePricing(replaced);
+                return replaced;
+            }
+            if (version < Pricing.CurrentVersion)
+            {
+                Pricing migrated = Migrate(root);
+                SavePricing(migrated);
+                return migrated;
+            }
+
+            var p = DefaultPricing();
             if (root.TryGetValue("defaultModel", out v) && v != null) p.DefaultModel = v.ToString();
-            if (root.TryGetValue("usdToCny", out v) && v != null) { try { p.UsdToCny = Convert.ToDouble(v, CultureInfo.InvariantCulture); } catch { } }
-            if (root.TryGetValue("offPeakStart", out v) && v != null) p.OffPeakStart = v.ToString();
-            if (root.TryGetValue("offPeakEnd", out v) && v != null) p.OffPeakEnd = v.ToString();
-            if (root.TryGetValue("weekendAllOffPeak", out v) && v != null) { try { p.WeekendAllOffPeak = Convert.ToBoolean(v); } catch { } }
+            if (root.TryGetValue("weekendsOffPeak", out v) && v != null) { try { p.WeekendsOffPeak = Convert.ToBoolean(v); } catch { } }
+            if (root.TryGetValue("peakWindows", out v) && v != null)
+            {
+                // JSON arrays come back as object[] of Dictionary<string,object>
+                object[] arr = v as object[];
+                if (arr != null)
+                {
+                    p.PeakWindows.Clear();
+                    foreach (object o in arr)
+                    {
+                        var w = o as Dictionary<string, object>;
+                        if (w == null) continue;
+                        var pw = new PeakWindow();
+                        if (w.TryGetValue("start", out v) && v != null) pw.Start = v.ToString();
+                        if (w.TryGetValue("end", out v) && v != null) pw.End = v.ToString();
+                        p.PeakWindows.Add(pw);
+                    }
+                }
+            }
             var models = Get(root, "models");
             if (models != null && models.Count > 0)
             {
@@ -295,15 +375,75 @@ internal static class Usage
         catch { return DefaultPricing(); }
     }
 
+    /// <summary>
+    /// The file exists but is not readable JSON. The writer used to emit a
+    /// `_comment` line WITHOUT a trailing comma, which made every load throw and
+    /// silently fall back to the defaults - the user's price edits were dropped
+    /// on each restart (and the v1/v2 migrations never ran). Keep the broken file
+    /// for inspection and start a clean, valid one.
+    /// </summary>
+    private static Pricing RecoverPricing()
+    {
+        Pricing fresh = DefaultPricing();
+        try { if (File.Exists(PricingFile)) File.Copy(PricingFile, PricingFile + ".broken", true); }
+        catch { }
+        SavePricing(fresh);
+        return fresh;
+    }
+
+    /// <summary>
+    /// v2 -> v3: keep the money the user had configured (the retired model rows
+    /// only ever carried the same numbers), adopt the new peak windows and the
+    /// single current model id.
+    /// </summary>
+    private static Pricing Migrate(Dictionary<string, object> old)
+    {
+        Pricing p = DefaultPricing();
+        try
+        {
+            object v;
+            string oldDefault = null;
+            if (old.TryGetValue("defaultModel", out v) && v != null) oldDefault = v.ToString();
+            var models = Get(old, "models");
+            Dictionary<string, object> pick = null;
+            if (models != null && models.Count > 0)
+            {
+                if (oldDefault != null && models.ContainsKey(oldDefault)) pick = models[oldDefault] as Dictionary<string, object>;
+                if (pick == null)
+                    foreach (KeyValuePair<string, object> kv in models) { pick = kv.Value as Dictionary<string, object>; if (pick != null) break; }
+            }
+            if (pick != null && p.Models.Count > 0)
+            {
+                ModelPrice m = p.Models[0];
+                if (pick.TryGetValue("in", out v) && v != null) m.In = ToD(v);
+                if (pick.TryGetValue("out", out v) && v != null) m.Out = ToD(v);
+                if (pick.TryGetValue("cacheRead", out v) && v != null) m.CacheRead = ToD(v);
+                if (pick.TryGetValue("cacheWrite", out v) && v != null) m.CacheWrite = ToD(v);
+                if (pick.TryGetValue("peakMultiplier", out v) && v != null) m.PeakMultiplier = ToD(v);
+            }
+        }
+        catch { }
+        return p;
+    }
+
     private static double ToD(object o) { try { return Convert.ToDouble(o, CultureInfo.InvariantCulture); } catch { return 0; } }
 
+    /// <summary>
+    /// Defaults in 元 / 1M tokens (off-peak; peak = ×2). User-supplied table:
+    /// cache-hit input 0.02 (peak 0.04), cache-miss input 1 (peak 2),
+    /// output 4 (peak 8). Busy hours: 周一至周五 09:00-12:00、14:00-18:00
+    /// (Beijing time), everything else off-peak.
+    /// </summary>
     public static Pricing DefaultPricing()
     {
         var p = new Pricing();
-        p.Models.Add(Make("deepseek-v4-flash", 0.14, 0.28, 0.0028, 0));
-        p.Models.Add(Make("deepseek-v4-pro", 0.435, 0.87, 0.003625, 0));
-        p.Models.Add(Make("deepseek-v4-flash-vision-exp", 0.14, 0.28, 0.0028, 0));
-        p.Models.Add(Make("deepseek-v4.1-flash-expires-on-0910", 0.14, 0.28, 0.0028, 0));
+        p.PeakWindows.Add(new PeakWindow("09:00", "12:00"));
+        p.PeakWindows.Add(new PeakWindow("14:00", "18:00"));
+        p.WeekendsOffPeak = true;
+        // One model only: the backend now reports a single "deepseek-flash"
+        // family, and pricing is looked up through this row.
+        p.Models.Add(Make("deepseek-flash", 1.0, 4.0, 0.02, 0));
+        p.DefaultModel = "deepseek-flash";
         return p;
     }
     private static ModelPrice Make(string id, double i, double o, double cr, double cw)
@@ -320,12 +460,19 @@ internal static class Usage
             if (!Directory.Exists(DataDir)) Directory.CreateDirectory(DataDir);
             var sb = new StringBuilder();
             sb.AppendLine("{");
-            sb.AppendLine("  \"_comment\": \"USD per 1M tokens. off-peak rates; peak = rate * peakMultiplier. Edit freely.\",");
+            sb.AppendLine("  \"_comment\": \"元 / 百万 tokens 的空闲价；高峰价 = 空闲价 × peakMultiplier。peakWindows 是北京时间的高峰时段（其余为空闲），可直接编辑。\",");
+            sb.AppendLine("  \"version\": " + Pricing.CurrentVersion + ",");
+            sb.AppendLine("  \"currency\": \"CNY\",");
             sb.AppendLine("  \"defaultModel\": \"" + p.DefaultModel + "\",");
-            sb.AppendLine("  \"usdToCny\": " + p.UsdToCny.ToString(CultureInfo.InvariantCulture) + ",");
-            sb.AppendLine("  \"offPeakStart\": \"" + p.OffPeakStart + "\",");
-            sb.AppendLine("  \"offPeakEnd\": \"" + p.OffPeakEnd + "\",");
-            sb.AppendLine("  \"weekendAllOffPeak\": " + (p.WeekendAllOffPeak ? "true" : "false") + ",");
+            sb.AppendLine("  \"weekendsOffPeak\": " + (p.WeekendsOffPeak ? "true" : "false") + ",");
+            sb.AppendLine("  \"peakWindows\": [");
+            for (int i = 0; i < p.PeakWindows.Count; i++)
+            {
+                PeakWindow w = p.PeakWindows[i];
+                sb.Append("    { \"start\": \"").Append(w.Start).Append("\", \"end\": \"").Append(w.End)
+                  .Append("\" }").Append(i == p.PeakWindows.Count - 1 ? "" : ",").AppendLine();
+            }
+            sb.AppendLine("  ],");
             sb.AppendLine("  \"models\": {");
             for (int i = 0; i < p.Models.Count; i++)
             {
@@ -369,6 +516,22 @@ internal static class Usage
     }
 
     // ---- history (aggregated deltas) --------------------------------------
+
+    /// <summary>
+    /// Cost of one stored interval, recomputed with the CURRENT price list.
+    /// Every history line keeps its tokens, which is what makes "追溯" possible:
+    /// changing the pricing never has to destroy or invalidate old numbers.
+    /// </summary>
+    public static double CostOfTick(Pricing p, UsageTick t)
+    {
+        ModelPrice m = p.Find(p.DefaultModel);
+        // Recompute the tier from the stored timestamp: the "off" flag inside old
+        // lines was recorded with the PREVIOUS window definition (a single
+        // 00:30-08:30 off-peak window), which billed the lunch break and the
+        // evening at peak rates.
+        return CostOf(p, m, t.In, t.Out, t.CacheRead, t.CacheWrite, p.IsOffPeak(t.Time));
+    }
+
     private static readonly Dictionary<string, long[]> _last = new Dictionary<string, long[]>();
     private static bool _seeded;
 
@@ -555,12 +718,22 @@ internal static class Usage
     /// <summary>Cost + tokens consumed in the last <paramref name="hours"/> hours.</summary>
     public static void Window(List<UsageTick> hist, double hours, out double cost, out long tokens)
     {
+        Window(hist, hours, null, false, out cost, out tokens);
+    }
+
+    /// <summary>
+    /// Same, but when <paramref name="retroactive"/> the amount is recomputed
+    /// from the stored tokens with the CURRENT pricing instead of the ledger
+    /// value written at the time (so editing prices never loses history).
+    /// </summary>
+    public static void Window(List<UsageTick> hist, double hours, Pricing p, bool retroactive, out double cost, out long tokens)
+    {
         cost = 0; tokens = 0;
         DateTime from = DateTime.Now.AddHours(-hours);
         foreach (UsageTick t in hist)
         {
             if (t.Time < from) continue;
-            cost += t.Cost;
+            cost += (retroactive && p != null) ? CostOfTick(p, t) : t.Cost;
             tokens += t.In + t.Out + t.CacheRead + t.CacheWrite;
         }
     }
@@ -568,17 +741,51 @@ internal static class Usage
     /// <summary>Cost consumed since local midnight.</summary>
     public static double Today(List<UsageTick> hist)
     {
+        return Today(hist, null, false);
+    }
+
+    public static double Today(List<UsageTick> hist, Pricing p, bool retroactive)
+    {
         double c = 0;
         DateTime today = DateTime.Today;
-        foreach (UsageTick t in hist) if (t.Time >= today) c += t.Cost;
+        foreach (UsageTick t in hist)
+        {
+            if (t.Time < today) continue;
+            c += (retroactive && p != null) ? CostOfTick(p, t) : t.Cost;
+        }
         return c;
     }
 
     /// <summary>Cost consumed since a local timestamp (used for the calendar month).</summary>
     public static double Since(List<UsageTick> hist, DateTime from)
     {
+        return Since(hist, from, null, false);
+    }
+
+    public static double Since(List<UsageTick> hist, DateTime from, Pricing p, bool retroactive)
+    {
         double c = 0;
-        foreach (UsageTick t in hist) if (t.Time >= from) c += t.Cost;
+        foreach (UsageTick t in hist)
+        {
+            if (t.Time < from) continue;
+            c += (retroactive && p != null) ? CostOfTick(p, t) : t.Cost;
+        }
+        return c;
+    }
+
+    /// <summary>
+    /// All-time cost of everything the history covers, recomputed with the
+    /// current pricing (the 累计 figure in retroactive mode).
+    /// </summary>
+    public static double HistoryCost(List<UsageTick> hist, Pricing p, out long inTok, out long outTok, out long cacheRead, out long cacheWrite)
+    {
+        double c = 0;
+        inTok = outTok = cacheRead = cacheWrite = 0;
+        foreach (UsageTick t in hist)
+        {
+            c += CostOfTick(p, t);
+            inTok += t.In; outTok += t.Out; cacheRead += t.CacheRead; cacheWrite += t.CacheWrite;
+        }
         return c;
     }
 
@@ -628,10 +835,10 @@ internal static class Usage
         return s;
     }
 
-    public static string Money(double usd, Pricing p)
+    /// <summary>Formats a 元 amount (prices are CNY-denominated since v2).</summary>
+    public static string Money(double cny, Pricing p)
     {
-        if (p == null || p.UsdToCny <= 0) return "$" + usd.ToString("F3", CultureInfo.InvariantCulture);
-        return "¥" + (usd * p.UsdToCny).ToString("F2", CultureInfo.InvariantCulture);
+        return "¥" + cny.ToString("F2", CultureInfo.InvariantCulture);
     }
 
     public static string Tokens(long n)
