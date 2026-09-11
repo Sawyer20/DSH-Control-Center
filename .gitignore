@@ -1,0 +1,16 @@
+# 依赖与便携运行时（由 install-dsh.cmd 按需重建）
+node_modules/
+.tools/
+
+# 运行与构建产物
+logs/
+DSH-old.exe
+DSH.build.exe
+redist/
+
+# 兜底默认工作区（setup.ps1 / 壳会建；里面的文件是用户数据）
+default-workspace/
+workdir.txt
+
+# 依赖清单不进仓库（会列出后端全部依赖的包名/版本，属后端依赖图信息）；本地保留以便复现安装
+pnpm-lock.yaml

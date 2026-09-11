@@ -1,0 +1,17 @@
+# pnpm >= 10.32 / 11 的原生模块构建白名单（新机制：allowBuilds）
+# pnpm 11 已把 onlyBuiltDependencies 降级为 legacy 设置，不再生效，
+# 必须用 allowBuilds 逐包允许执行安装脚本（node-pty/koffi 等原生模块）
+allowBuilds:
+  "@deepseek-ai/dsh-subprocess-local": true
+  "@google/genai": true
+  "koffi": true
+  "node-pty": true
+  "protobufjs": true
+
+# 兼容旧版 pnpm（< 10.32）仍读取的列表形式；新版忽略，保留无害
+onlyBuiltDependencies:
+  - "@deepseek-ai/dsh-subprocess-local"
+  - "@google/genai"
+  - "koffi"
+  - "node-pty"
+  - "protobufjs"
