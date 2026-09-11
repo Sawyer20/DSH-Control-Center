@@ -1,37 +1,9 @@
-# ============================================================================
-#  公开仓库只装"能跑起来的东西"（= pack-for-other-pc 的白名单）
-#  作者本地的开发 / 发布 / 验证工具不入库，但文件仍留在本机
-# ============================================================================
-
-# ---- 依赖与便携运行时（install-dsh.cmd 按需重建）----
+# 依赖与便携运行时（由 install-dsh.cmd 按需重建）
 node_modules/
 .tools/
 
-# ---- 运行与构建产物 ----
+# 运行与构建产物
 logs/
 DSH-old.exe
 DSH.build.exe
 redist/
-
-# ---- 作者本地的开发 / 发布工具 ----
-pack-for-other-pc.cmd
-pack-for-other-pc.ps1
-migrate-to-dsh-app.cmd
-migrate-dsh-app.ps1
-gen-icons.ps1
-png-to-ico.ps1
-icon-src/
-logo.png
-smoke-probe.cs
-run-smoke-test.cmd
-render-probe.cs
-render-preview.cmd
-index.js.bak-llm-deepseek
-
-# ---- 一次性残留与探针临时文件 ----
-*.bak-*
-settings-copy.yaml
-pricing-*.json
-dsh-smoke-*
-
-# NOTE: 不要把 .gitignore 自己写进来（曾经这样写过，结果它一直没入库）

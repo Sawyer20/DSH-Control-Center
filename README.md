@@ -13,7 +13,7 @@ DSH 控制中心的托盘小程序，把本机的 DSH 后端管起来：**服务
 会话库、备份恢复、诊断包**，桌面上还有一只会喷水的鲸鱼。便携，免安装、免管理员。
 界面为中文；后端本体需自备（见[环境要求](#环境要求)）。
 
-![总览](screenshots/overview.png)
+<img src="screenshots/overview.png" width="660" alt="总览">
 
 ## 主要功能
 
@@ -26,11 +26,11 @@ DSH 控制中心的托盘小程序，把本机的 DSH 后端管起来：**服务
 - **备份与诊断** — `~/.dsh` 打包备份（**API 凭据默认不进包**），恢复只补缺失、绝不覆盖；一键生成脱敏诊断包便于排障。
 - **桌面宠物** — 矢量移植的鲸鱼喷水动画：速度 0.2–3.0× 可调、任务完成喷到 100%、异常结束只提醒不喷、空闲回到低水花；可拖动、可关闭。
 
-![模型与成本](screenshots/model-and-cost.png)
+<img src="screenshots/model-and-cost.png" width="660" alt="模型与成本">
 
-![通知](screenshots/notifications.png)
+<img src="screenshots/notifications.png" width="660" alt="通知">
 
-![宠物](screenshots/pet.png)
+<img src="screenshots/pet.png" width="240" alt="桌面宠物">
 
 ## 环境要求
 
