@@ -7,3 +7,7 @@ logs/
 DSH-old.exe
 DSH.build.exe
 redist/
+
+# 兜底默认工作区（setup.ps1 / 壳会建；里面的文件是用户数据）
+default-workspace/
+workdir.txt

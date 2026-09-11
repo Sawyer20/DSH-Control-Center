@@ -974,6 +974,23 @@ internal class SettingsView : UserControl
 
         // (the "include API credentials" switch lives on the 备份 page now)
 
+        // ---- launch directory (informational: the web UI owns the workspace) ----
+        st.Children.Add(new Border { Height = 18, Background = Brushes.Transparent });
+        var lb7 = new StackPanel();
+        lb7.Children.Add(Ui.Tb("后端启动目录", 13, WpfTheme.TextPrimary, FontWeights.SemiBold));
+        _wsNow = Ui.Tb("—", 12, WpfTheme.TextPrimary, FontWeights.SemiBold);
+        _wsNow.FontFamily = WpfTheme.Mono;
+        _wsNow.TextWrapping = TextWrapping.Wrap;
+        lb7.Children.Add(_wsNow);
+        _wsSource = Ui.Tb("", 11, WpfTheme.TextMuted);
+        _wsSource.TextWrapping = TextWrapping.Wrap;
+        lb7.Children.Add(_wsSource);
+        st.Children.Add(lb7);
+        _wsStatus = Ui.Tb("", 11.5, WpfTheme.TextSecond);
+        _wsStatus.TextWrapping = TextWrapping.Wrap;
+        _wsStatus.Margin = new Thickness(0, 4, 0, 0);
+        st.Children.Add(_wsStatus);
+
         // ---- diagnostics (P0-4) ----
         st.Children.Add(new Border { Height = 18, Background = Brushes.Transparent });
         var row4 = new Grid();
@@ -1082,6 +1099,34 @@ internal class SettingsView : UserControl
         _segDark.Background = dark ? WpfTheme.CardSolid : Brushes.Transparent;
         _segDarkText.Foreground = dark ? WpfTheme.TextPrimary : WpfTheme.TextSecond;
     }
+
+    // ---- launch directory (read-only: the web UI owns the workspace) --------
+    // DSH picks the workspace PER SESSION (the web UI asks 选择一个工作区开始 and
+    // groups sessions 按工作区); the backend process cwd is only the fallback when
+    // a session is created without one. So the shell shows the launch directory and
+    // nothing else - which session belongs to which workspace is on 会话库.
+    private TextBlock _wsNow, _wsSource, _wsStatus;
+
+    /// <summary>Read-only note about the directory the backend was launched in.</summary>
+    public void UpdateWorkspace(string current, string source)
+    {
+        if (_wsNow == null) return;
+        _wsNow.Text = String.IsNullOrEmpty(current) ? "（未解析）" : current;
+        _wsSource.Text = "来源：" + (String.IsNullOrEmpty(source) ? "默认" : source)
+            + "　· 工作区由网页按会话决定（session.create 传 workspaceId）；"
+            + "这个目录只在网页没指定工作区时兜底。各会话属于哪个工作区见「会话库」。";
+        SetWorkspaceStatus("", false);
+    }
+
+    public void SetWorkspaceStatus(string text, bool bad)
+    {
+        if (_wsStatus == null) return;
+        _wsStatus.Text = text;
+        _wsStatus.Foreground = bad ? WpfTheme.Danger : WpfTheme.TextMuted;
+    }
+
+    /// <summary>Test seam: the launch directory shown in the settings card.</summary>
+    internal string WorkspaceShown { get { return _wsNow == null ? "" : _wsNow.Text; } }
 }
 
 internal class LogsView : UserControl
@@ -1132,6 +1177,9 @@ internal class SessionsView : UserControl
     private TextBox _search;
     private TextBlock _hint;
     private TextBlock _count;
+    /// <summary>Workspace filter ("" = all). Sessions are grouped by project.</summary>
+    private string _filter = "";
+    private readonly StackPanel _filters = new StackPanel { Orientation = Orientation.Horizontal };
 
     /// <summary>Raised with the session id.</summary>
     public event EventHandler<string> ExportRequested;
@@ -1184,12 +1232,17 @@ internal class SessionsView : UserControl
         };
         _search.TextChanged += delegate { Rebuild(); };
         searchHost.Children.Add(_search);
-        _hint = Ui.Tb("搜索标题或会话 id…", 13, WpfTheme.TextLight);
+        _hint = Ui.Tb("搜索标题 / 会话 id / 工作区…", 13, WpfTheme.TextLight);
         _hint.Margin = new Thickness(12, 0, 0, 0);
         _hint.VerticalAlignment = VerticalAlignment.Center;
         _hint.IsHitTestVisible = false;
         searchHost.Children.Add(_hint);
         st.Children.Add(searchHost);
+
+        // which project each session belongs to: a filter row built from the
+        // sessions themselves (the web UI calls the same thing 工作区)
+        st.Children.Add(new Border { Height = 10, Background = Brushes.Transparent });
+        st.Children.Add(_filters);
 
         st.Children.Add(new Border { Height = 12, Background = Brushes.Transparent });
 
@@ -1225,14 +1278,18 @@ internal class SessionsView : UserControl
         _list.Children.Clear();
         string q = _search == null ? "" : _search.Text.Trim();
         if (_hint != null) _hint.Visibility = q.Length == 0 ? Visibility.Visible : Visibility.Collapsed;
+        RebuildFilters();
 
         int shown = 0, onDisk = 0;
         foreach (SessionEntry e in _all)
         {
+            if (_filter.Length > 0 && !String.Equals(WorkspaceKey(e), _filter, StringComparison.OrdinalIgnoreCase)) continue;
             if (q.Length > 0)
             {
                 bool hit = (e.Title ?? "").IndexOf(q, StringComparison.OrdinalIgnoreCase) >= 0
-                        || (e.Id ?? "").IndexOf(q, StringComparison.OrdinalIgnoreCase) >= 0;
+                        || (e.Id ?? "").IndexOf(q, StringComparison.OrdinalIgnoreCase) >= 0
+                        || (e.Workspace ?? "").IndexOf(q, StringComparison.OrdinalIgnoreCase) >= 0
+                        || (e.WorkspaceName ?? "").IndexOf(q, StringComparison.OrdinalIgnoreCase) >= 0;
                 if (!hit) continue;
             }
             if (e.OnDisk) onDisk++;
@@ -1242,12 +1299,73 @@ internal class SessionsView : UserControl
         }
         if (shown == 0)
         {
-            var empty = Ui.Tb(q.Length > 0 ? "没有匹配的会话" : "还没有会话记录", 12, WpfTheme.TextLight);
+            var empty = Ui.Tb(q.Length > 0 || _filter.Length > 0 ? "没有匹配的会话" : "还没有会话记录", 12, WpfTheme.TextLight);
             empty.Margin = new Thickness(0, 8, 0, 8);
             _list.Children.Add(empty);
         }
         if (_count != null)
-            _count.Text = shown + " / " + _all.Count + " 个会话 · " + onDisk + " 个有磁盘文件";
+        {
+            int projects = 0;
+            var seen = new Dictionary<string, bool>(StringComparer.OrdinalIgnoreCase);
+            foreach (SessionEntry e in _all)
+            {
+                string k = WorkspaceKey(e);
+                if (k.Length == 0 || seen.ContainsKey(k)) continue;
+                seen[k] = true; projects++;
+            }
+            _count.Text = shown + " / " + _all.Count + " 个会话 · " + projects + " 个工作区 · " + onDisk + " 个有磁盘文件";
+        }
+    }
+
+    /// <summary>The session's project key (its workspace path, or the disk folder name).</summary>
+    private static string WorkspaceKey(SessionEntry e)
+    {
+        string p = (e.Workspace ?? "").TrimEnd('\\');
+        if (p.Length > 0) return p;
+        return e.WorkspaceName ?? "";
+    }
+
+    /// <summary>One chip per workspace, with session counts; clicking filters the list.</summary>
+    private void RebuildFilters()
+    {
+        _filters.Children.Clear();
+        var counts = new Dictionary<string, int>(StringComparer.OrdinalIgnoreCase);
+        var labels = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+        foreach (SessionEntry e in _all)
+        {
+            string k = WorkspaceKey(e);
+            if (k.Length == 0) continue;
+            int n;
+            counts.TryGetValue(k, out n);
+            counts[k] = n + 1;
+            if (!labels.ContainsKey(k)) labels[k] = (e.WorkspaceName ?? "").Length > 0 ? e.WorkspaceName : k;
+        }
+        if (counts.Count > 1)
+        {
+            _filters.Children.Add(FilterChip("全部 " + _all.Count, "", _filter.Length == 0));
+            foreach (KeyValuePair<string, int> kv in counts)
+                _filters.Children.Add(FilterChip(labels[kv.Key] + " " + kv.Value, kv.Key,
+                    String.Equals(kv.Key, _filter, StringComparison.OrdinalIgnoreCase)));
+        }
+    }
+
+    private FrameworkElement FilterChip(string text, string key, bool active)
+    {
+        var b = new Border
+        {
+            CornerRadius = new CornerRadius(9),
+            Padding = new Thickness(9, 3, 9, 3),
+            Margin = new Thickness(0, 0, 6, 4),
+            Cursor = Cursors.Hand,
+            Background = active ? WpfTheme.AccentSoft : WpfTheme.SwitchOff
+        };
+        b.Child = Ui.Tb(text, 11, active ? WpfTheme.Accent : WpfTheme.TextSecond);
+        b.MouseLeftButtonUp += delegate
+        {
+            _filter = String.Equals(_filter, key, StringComparison.OrdinalIgnoreCase) ? "" : key;
+            Rebuild();
+        };
+        return b;
     }
 
     private FrameworkElement Row(SessionEntry e)
@@ -1260,9 +1378,41 @@ internal class SessionsView : UserControl
         string title = (e.Title ?? "").Length > 0 ? e.Title : "(无标题会话)";
         var t = Ui.Tb(title, 13, WpfTheme.TextPrimary, FontWeights.SemiBold);
         t.TextTrimming = TextTrimming.CharacterEllipsis;
-        t.ToolTip = title + "\n" + e.Id;
+        t.ToolTip = title + "\n" + e.Id + ((e.Workspace ?? "").Length > 0 ? "\n工作区：" + e.Workspace : "");
         info.Children.Add(t);
-        info.Children.Add(Ui.Tb(Meta(e), 11, WpfTheme.TextMuted));
+        string meta = Meta(e);
+        string ws = (e.WorkspaceName ?? "").Length > 0 ? e.WorkspaceName : "";
+        if (ws.Length > 0)
+        {
+            // the project chip: same grouping the web UI offers (按工作区)
+            var line = new StackPanel { Orientation = Orientation.Horizontal };
+            var chip = new Border
+            {
+                CornerRadius = new CornerRadius(8),
+                Padding = new Thickness(7, 1, 7, 1),
+                Margin = new Thickness(0, 2, 6, 2),
+                Background = WpfTheme.AccentSoft,
+                ToolTip = (e.Workspace ?? "").Length > 0 ? e.Workspace : ws
+            };
+            chip.Child = Ui.Tb(ws, 10.5, WpfTheme.Accent);
+            chip.Cursor = Cursors.Hand;
+            string key = WorkspaceKey(e);
+            chip.MouseLeftButtonUp += delegate
+            {
+                if (key.Length == 0) return;
+                _filter = key;
+                Rebuild();
+            };
+            line.Children.Add(chip);
+            var m = Ui.Tb(meta, 11, WpfTheme.TextMuted);
+            m.VerticalAlignment = VerticalAlignment.Center;
+            line.Children.Add(m);
+            info.Children.Add(line);
+        }
+        else
+        {
+            info.Children.Add(Ui.Tb(meta, 11, WpfTheme.TextMuted));
+        }
         g.Children.Add(info);
 
         var actions = new StackPanel { Orientation = Orientation.Horizontal, VerticalAlignment = VerticalAlignment.Center };
@@ -2548,6 +2698,7 @@ internal class DshWindow : Window
         _settings.UpdatePet(_petEnabled);
         _settings.UpdatePetSettings(_petRate, _petBusy);
         _settings.UpdateBackupKeep(_backupKeep);
+        RefreshWorkspaceCard();
         if (_backups != null) _backups.UpdateCredentials(_backupCreds);
         if (_pricingView != null)
         {
@@ -2558,6 +2709,11 @@ internal class DshWindow : Window
         ApplyPet();
         Notifications.MarkLegacyApprovalRead();    // one-off: old approval notices had no refId
         LoadNotifications();
+        // "No default workspace yet" is informational, not an error: the web UI picks
+        // the workspace per session (session.create sends workspaceId), and this
+        // directory is only the fallback. Say it once in the event stream - no
+        // notification, so the tray dot stays reserved for things that need action.
+        Diagnostics.Note("启动目录", Program.WorkDir + "（" + Program.WorkDirSource + "）");
 
         if (Program.ServerRunning())
         {
@@ -2885,6 +3041,18 @@ internal class DshWindow : Window
         if (String.IsNullOrEmpty(s)) return "";
         s = s.Replace("\r", " ").Replace("\n", " ").Trim();
         return s.Length <= max ? s : s.Substring(0, max) + "…";
+    }
+
+    /// <summary>
+    /// Pushes the directory the backend was launched in into the settings card.
+    /// Informational only: the web UI owns the workspace (per session), and the
+    /// shell deliberately does not try to manage it.
+    /// </summary>
+    private void RefreshWorkspaceCard()
+    {
+        if (_settings == null) return;
+        try { _settings.UpdateWorkspace(Program.WorkDir, Program.WorkDirSource); }
+        catch { }
     }
 
     /// <summary>
@@ -3498,6 +3666,7 @@ internal class DshWindow : Window
         if (key == "backups") LoadBackups();
         if (key == "budget") RefreshUsageCost();
         if (key == "notifications") LoadNotifications();
+        if (key == "settings") RefreshWorkspaceCard();      // the web UI may have moved it
     }
 
     // ---- business ----------------------------------------------------------
@@ -3640,7 +3809,7 @@ internal class DshWindow : Window
             + "· 内容：" + mf.Files + " 个文件 · " + Backup.SizeText(mf.Bytes)
             + (mf.ShellFiles > 0 ? "（含 " + mf.ShellFiles + " 个壳数据文件）" : "")
             + (mf.Credentials ? " · ⚠ 含 API 凭据" : " · 不含 API 凭据") + "\n\n"
-            + "恢复规则：**只补缺失文件**（不覆盖现有），并先把当前数据自动备份一份。\n"
+            + "恢复规则：只补缺失文件（不覆盖现有），并先把当前数据自动备份一份。\n"
             + (running && !_alreadyRunning ? "· 服务会先停止，恢复完成后自动重启（网页需刷新一次）。\n" : "")
             + (_alreadyRunning ? "· 注意：3080 由其他实例运行，恢复前建议先停止它，否则部分文件可能无法写入。\n" : "")
             + "\n继续？",
@@ -3760,7 +3929,7 @@ internal class DshWindow : Window
         if (running)
             body += "· 服务会先停止、删除后自动重启，网页端列表随之同步（当前页面需要刷新一次）\n";
         if (InUse(e))
-            body += "\n注意：该会话的文件当前正被服务占用，很可能是**你正在进行的对话**，删除后无法继续。\n";
+            body += "\n注意：该会话的文件当前正被服务占用，很可能是你正在进行的对话，删除后无法继续。\n";
 
         var answer = MessageBox.Show(body, "DSH · 删除会话",
             MessageBoxButton.YesNo, MessageBoxImage.Warning, MessageBoxResult.No);

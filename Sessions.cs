@@ -36,6 +36,10 @@ internal sealed class SessionEntry
     public string Approval = "";
     public bool PlanActive;
     public int TodoCount;
+    /// <summary>The session's project: its `identity.cwd`, i.e. the workspace it belongs to.</summary>
+    public string Workspace = "";
+    /// <summary>Display name for <see cref="Workspace"/> (registry title, else folder name).</summary>
+    public string WorkspaceName = "";
 
     public long Tokens { get { return In + Out + CacheRead + CacheWrite; } }
 
@@ -93,6 +97,7 @@ internal static class Sessions
             e.Approval = s.Approval;
             e.PlanActive = s.PlanActive;
             e.TodoCount = s.TodoCount;
+            e.Workspace = s.Cwd;
             byId[e.Id] = e;
         }
 
@@ -117,6 +122,11 @@ internal static class Sessions
                         e.OnDisk = true;
                         e.Folder = dir;
                         e.Bytes = FolderBytes(dir);
+                        // the folder above a session is the workspace; on disk it is a
+                        // mangled path (D:\DSH -> "--D-DSH--"), so only use it as a
+                        // last-resort label when the cache did not carry identity.cwd
+                        if (e.Workspace.Length == 0 && e.WorkspaceName.Length == 0)
+                            e.WorkspaceName = Path.GetFileName(ws);
                     }
                 }
             }
@@ -126,6 +136,26 @@ internal static class Sessions
         var list = new List<SessionEntry>(byId.Values);
         if (pricing != null)
             foreach (SessionEntry e in list) e.CostText = Usage.Money(e.Cost, pricing);
+        // Workspace labels: prefer the registry's own title ("DSH"), fall back to
+        // the folder's last segment ("DSH"), so rows read as projects, not paths.
+        Dictionary<string, string> titles = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+        try
+        {
+            foreach (WorkspaceEntry w in Workspace.List())
+            {
+                if (w.Path.Length > 0 && !titles.ContainsKey(w.Path.TrimEnd('\\')))
+                    titles[w.Path.TrimEnd('\\')] = w.Title.Length > 0 ? w.Title : Path.GetFileName(w.Path);
+            }
+        }
+        catch { }
+        foreach (SessionEntry e in list)
+        {
+            string key = (e.Workspace ?? "").TrimEnd('\\');
+            if (key.Length == 0) continue;
+            string title;
+            if (titles.TryGetValue(key, out title)) e.WorkspaceName = title;
+            else e.WorkspaceName = Path.GetFileName(key);
+        }
         list.Sort(delegate(SessionEntry a, SessionEntry b)
         {
             int c = b.When.CompareTo(a.When);

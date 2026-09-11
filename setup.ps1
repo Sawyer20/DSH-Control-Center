@@ -219,6 +219,19 @@ Write-Step 'Step 4/4  Creating the desktop shortcut ...'
 & (Join-Path $Root 'make-shortcut.ps1')
 if ($LASTEXITCODE -ne 0) { throw 'Could not create the desktop shortcut.' }
 
+# ---------------------------------------------------------------------------
+# 5. Default workspace
+#    The backend is started in a folder, and that folder is the workspace a
+#    session gets when the web UI is not told otherwise (DSH itself asks you to
+#    pick a workspace per session). Create a purpose-named EMPTY folder for it,
+#    so a session never ends up inside the program's own directory.
+# ---------------------------------------------------------------------------
+$defaultWs = Join-Path $Root 'default-workspace'
+if (-not (Test-Path -LiteralPath $defaultWs)) {
+    New-Item -ItemType Directory -Force -Path $defaultWs | Out-Null
+}
+Write-Host "  Default workspace ready: $defaultWs"
+
 Write-Host ''
 Write-Host '============================================================'
 Write-Host '  All done. Double-click the "DSH" shortcut on the desktop.'

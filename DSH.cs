@@ -37,7 +37,7 @@ using System.Management;
 internal static class Program
 {
     // Bump on EVERY source change (see 台账.md / README.md)
-    internal const string BuildId = "2026-09-02-52";
+    internal const string BuildId = "2026-09-02-58";
 
     internal const string Url = "http://127.0.0.1:3080";
     internal const int Port = 3080;
@@ -57,12 +57,23 @@ internal static class Program
         return cands[0];
     }
 
-    // The DSH backend must be launched with the WORKSPACE as its working
-    // directory (DSH derives the workspace from cwd). Resolution order:
-    //   1) workdir.txt next to the exe, if it names an existing directory;
-    //   2) if this app folder is named "DSH-App", the folder above it
-    //      (layout A: D:\DSH = workspace root, D:\DSH\DSH-App = software);
-    //   3) otherwise the app folder itself (legacy single-folder layout).
+    // The backend needs a working directory, nothing more: DSH decides the
+    // WORKSPACE per session (session.create sends workspaceId; the web UI's empty
+    // state literally asks "选择一个工作区开始"), and the process cwd is only its
+    // fallback (dsh-host-apiproxy: cwd = workspace?.path ?? payload.cwd ??
+    // process.cwd()). So the shell owns nothing but that fallback:
+    //   1) workdir.txt next to the exe, when the user pinned one explicitly;
+    //   2) otherwise <app>\default-workspace - a purpose-named EMPTY folder created
+    //      on demand, so a session that the web UI creates without a workspace
+    //      lands in a folder meant for that instead of the program's own folder
+    //      (where an agent turn could touch the app's files).
+    // A stale workdir.txt (folder deleted / copied elsewhere) falls back to the
+    // same folder, which is why the fallback is derived from RootDir, not stored.
+    internal const string DefaultWorkspaceFolder = "default-workspace";
+
+    /// <summary>How the launch directory was decided (shown in 设置 as a note).</summary>
+    internal static string WorkDirSource;
+
     private static string ResolveWorkDir()
     {
         try
@@ -71,16 +82,28 @@ internal static class Program
             if (File.Exists(f))
             {
                 string t = File.ReadAllText(f).Trim();
-                if (t.Length > 0 && Directory.Exists(t)) return t;
+                if (t.Length > 0 && Directory.Exists(t)) { WorkDirSource = "本机设置（workdir.txt）"; return t; }
             }
         }
         catch { }
-        if (Path.GetFileName(RootDir).Equals("DSH-App", StringComparison.OrdinalIgnoreCase))
-        {
-            DirectoryInfo parent = Directory.GetParent(RootDir);
-            if (parent != null) return parent.FullName;
-        }
-        return RootDir;
+        string d = DecideWorkDir("");
+        WorkDirSource = String.Equals(d, RootDir, StringComparison.OrdinalIgnoreCase)
+            ? "应用目录（只读位置，无法建立默认工作区）"
+            : "应用目录下的 " + DefaultWorkspaceFolder + "（兜底默认工作区）";
+        return d;
+    }
+
+    /// <summary>
+    /// The launch directory: an explicit workdir.txt wins, otherwise the
+    /// purpose-named default workspace under the app folder (created on demand).
+    /// Kept as a function so the smoke probe can assert both branches.
+    /// </summary>
+    internal static string DecideWorkDir(string fromFile)
+    {
+        if (!String.IsNullOrEmpty(fromFile) && Directory.Exists(fromFile)) return fromFile;
+        string ws = Path.Combine(RootDir, DefaultWorkspaceFolder);
+        try { Directory.CreateDirectory(ws); } catch { return RootDir; }
+        return ws;
     }
 
     private static Mutex _mutex;

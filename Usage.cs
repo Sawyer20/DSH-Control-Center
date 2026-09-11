@@ -36,6 +36,7 @@ internal sealed class SessionUsage
     public int TodoCount;                    // todos[] length
     public int PendingCalls;                 // in-flight tool calls (approval heuristic)
     public DateTime CreatedAt = DateTime.MinValue;   // identity.createdAt
+    public string Cwd = "";                          // identity.cwd = the session's workspace (project)
     public double Cost;          // filled by Usage.ComputeCosts
 }
 
@@ -201,6 +202,11 @@ internal static class Usage
                 {
                     long cms = Num(ident, "createdAt");
                     if (cms > 0) u.CreatedAt = FromUnixMs(cms);
+                    // identity.cwd is the session's workspace (its project) - the same
+                    // folder the web UI groups sessions by. NOTE: Val() only returns
+                    // SUB-DICTIONARIES, so a scalar must be read with TryGetValue.
+                    object cw;
+                    if (ident.TryGetValue("cwd", out cw) && cw != null) u.Cwd = cw.ToString();
                 }
                 u.Title = Str(Val(rows, "title"));
 
